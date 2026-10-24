@@ -53,6 +53,11 @@ export const CodexProviderOptionsSchema = z
       .object({
         network_proxy: z.union([z.boolean(), NetworkPolicySchema]).optional(),
         multi_agent_v2: z.boolean().optional(),
+        js_repl: z.boolean().optional(),
+        computer_use: z.boolean().optional(),
+        browser_use: z.boolean().optional(),
+        plugins: z.boolean().optional(),
+        apps: z.boolean().optional(),
       })
       .strict()
       .optional(),

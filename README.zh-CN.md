@@ -2,7 +2,7 @@
   <img src="packages/website/public/logo.svg" width="64" height="64" alt="Paseo logo">
 </p>
 
-<h1 align="center">Paseo</h1>
+<h1 align="center">Paseo (Omni Multi-Agent Edition)</h1>
 
 <p align="center">
   <a href="README.md">English</a> ·
@@ -12,77 +12,81 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/getpaseo/paseo/stargazers">
-    <img src="https://img.shields.io/github/stars/getpaseo/paseo?style=flat&logo=github" alt="GitHub stars">
-  </a>
-  <a href="https://github.com/getpaseo/paseo/releases">
-    <img src="https://img.shields.io/github/v/release/getpaseo/paseo?style=flat&logo=github" alt="GitHub release">
-  </a>
-  <a href="https://x.com/moboudra">
-    <img src="https://img.shields.io/badge/%40moboudra-555?logo=x" alt="X">
-  </a>
-  <a href="https://discord.gg/jz8T2uahpH">
-    <img src="https://img.shields.io/badge/Discord-555?logo=discord" alt="Discord">
-  </a>
-  <a href="https://www.reddit.com/r/PaseoAI/">
-    <img src="https://img.shields.io/badge/Reddit-555?logo=reddit" alt="Reddit">
-  </a>
+  <strong>ZCode (GLM-5.3) · OpenAI Codex · Google Antigravity (<code>agy</code>) · DeepSeek (<code>dsh</code>)</strong><br>
+  跨 Windows / macOS 多主机统一调度 + 原生 Windows Computer Use & Browser Use 增强底座
 </p>
-
-<p align="center">Claude Code、Codex、Copilot、OpenCode 和 Pi agents 的统一界面。</p>
-
-<p align="center">
-  <img src="https://paseo.sh/hero-mockup.png" alt="Paseo app screenshot" width="100%">
-</p>
-
-<p align="center">
-  <img src="https://paseo.sh/mobile-mockup.png" alt="Paseo mobile app" width="100%">
-</p>
-
-> [!NOTE]
-> 我是独立维护者，不一定每天都能及时处理 GitHub Issues。
-> 如果问题很紧急或阻塞了你，[Discord](https://discord.gg/jz8T2uahpH) 是最快联系到我的地方。
 
 ---
+
+## 🚀 Omni 增强版核心特性（针对 NetBird 异地组网与 Windows 桌面控制定制）
+
+本分支（[`coutanz/paseo`](https://github.com/coutanz/paseo)）在上游 `getpaseo/paseo` 基础上，专门补齐了四大主力 Agent 的原生驱动与跨机 Windows Computer Use 能力：
+
+1. **四大主力 Agent 全量内置驱动 (`plugins/`)**：
+   - **GLM ZCode (`plugins/zcode-provider`)**：原生对接 Z.AI 官方 `zcode` CLI（支持 `glm-5.3` / `glm-5.3-flash` / `glm-5.1` / `glm-5-turbo`，内置 `yolo` 无人值守全权限模式、图片附件 `--attach` 与会话恢复 `--resume`）。
+   - **DeepSeek Harness (`plugins/dsh-provider`)**：原生对接 `dsh acp` (Agent Client Protocol) 服务模式。
+   - **Google Antigravity (`plugins/antigravity-provider`)**：原生对接 `agy` CLI 流式 JSON 协议。
+   - **OpenAI Codex (`codex`)**：解禁 `CodexProviderOptionsSchema` 严格校验，原生支持在 Paseo 中透传 `features: { computer_use: true, browser_use: true, plugins: true, apps: true }`。
+2. **四大 Agent 共享的 Computer Use & Browser Use 一键注入 (`scripts/sync-computer-use-mcp.mjs`)**：
+   - 一条命令自动将 **`windows-desktop` (`uvx windows-mcp`)**、**`computer-use` (`@qwen-code/open-computer-use`)** 以及 **`browser-use` (`@playwright/mcp`)** 同时同步写入：
+     - Codex (`~/.codex/config.toml`)
+     - Antigravity (`~/.gemini/antigravity-cli/settings.json`)
+     - ZCode (`~/.zcode/cli/setting.json`)
+     - DeepSeek DSH (`~/.dsh/config.json`)
+     - Paseo Daemon (`~/.paseo/config.json`)
+3. **Windows Session 1+ 交互式桌面守护与 NetBird 自动绑定 (`scripts/setup-windows-node.ps1`)**：
+   - 自动识别本机 **NetBird 虚拟局域网 IP (`100.x.x.x`)**。
+   - 自动注册 Windows 计划任务 `PaseoOmniDaemon`（强制 `LogonType = Interactive` 运行在当前登录的 GUI 桌面会话 Session 1+ 中，彻底解决传统 SSH / Windows 服务落在 `Session 0` 导致截屏黑屏、无法点击窗口的痛点）。
+4. **跨机器主从编排器 MCP (`scripts/omni-swarm-mcp.mjs`)**：
+   - 可挂载到主力机的 Antigravity / Codex / ZCode 中，提供 `paseo_swarm_list_nodes`、`paseo_swarm_register_node`、`paseo_swarm_dispatch_agent` 等工具，让你在主力机通过一句话跨 NetBird 指挥任意 Windows/Mac 节点上的指定 Agent 干活。
+
+---
+
+### ⚡ 三步部署你的多机 Agent 集群
+
+#### 第一步：在每台 Windows 节点上执行一键初始化
+以管理员或当前桌面用户打开 PowerShell：
+```powershell
+# 自动探测 NetBird IP、为 4 大 CLI 注入 Windows Computer Use & Browser Use MCP，并注册桌面会话自启守护任务
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows-node.ps1
+
+# 如果要同时绑定本地已打开远程调试端口的 Chrome 浏览器（复用登录态 Cookie）：
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows-node.ps1 -CdpEndpoint "http://127.0.0.1:9222"
+```
+
+#### 第二步：在每台 macOS 节点上执行初始化
+```bash
+chmod +x ./scripts/setup-mac-node.sh
+./scripts/setup-mac-node.sh
+```
+
+#### 第三步：单独同步本机四大 Agent 的 Computer Use MCP 配置
+如果你只想更新本机的 Codex / Antigravity / ZCode / DSH 配置文件：
+```bash
+node ./scripts/sync-computer-use-mcp.mjs
+```
+
+#### 第四步：在主力机挂载跨节点 Swarm 编排器（可选）
+在主力机执行以下命令，即可让你的 Antigravity (`agy`) 或 Codex 直接具备跨机器派活能力：
+```bash
+agy mcp add paseo-swarm node C:/path/to/paseo/scripts/omni-swarm-mcp.mjs
+```
+
+---
+
+## 上游 Paseo 基础介绍
 
 在你自己的机器上并行运行 agents。无论在手机上还是桌前，都能推进交付。
 
 - **自托管：** Agents 在你的机器上运行，使用完整的本地开发环境、工具、配置和技能。
-- **多提供商：** 通过同一个界面使用 Claude Code、Codex、Copilot、OpenCode 和 Pi。为每个任务选择合适的模型。
+- **多提供商：** 通过同一个界面使用 Claude Code、Codex、Copilot、OpenCode、Pi、Antigravity、ZCode 和 DeepSeek DSH。为每个任务选择合适的模型。
 - **语音控制：** 在语音模式下口述任务或讨论问题。需要免手操作时很方便。
 - **跨设备：** 支持 iOS、Android、桌面端、Web 和 CLI。在桌前开始工作，用手机查看进度，也可以从终端脚本化操作。
 - **隐私优先：** Paseo 没有遥测、追踪，也不会强制登录。
 
-## 赞助商
-
-<!-- Sponsors: one cell per sponsor in the order of packages/website/src/data/sponsors.ts, then "become a sponsor" cells up to three. -->
-<table>
-  <tr>
-    <td align="center" width="33%"><a href="https://hoplite.sh/?utm_source=paseo&utm_medium=readme&utm_campaign=sponsor"><picture><source media="(prefers-color-scheme: dark)" srcset="packages/website/public/sponsors/hoplite-on-dark.svg"><img src="packages/website/public/sponsors/hoplite-on-light.svg" alt="Hoplite" height="40"></picture></a><br><sub>Cloud coding agents</sub></td>
-    <td align="center" width="33%"><a href="https://paseo.sh/zh-CN/sponsor">成为 Paseo 赞助商</a></td>
-    <td align="center" width="33%"><a href="https://paseo.sh/zh-CN/sponsor">成为 Paseo 赞助商</a></td>
-  </tr>
-</table>
-
 ## 快速开始
 
 Paseo 会运行一个名为 daemon 的本地服务，用来管理你的 coding agents。桌面 app、移动 app、Web app 和 CLI 等客户端都会连接到它。
-
-### 前置条件
-
-你至少需要安装一个 agent CLI，并用你的凭据完成配置：
-
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-- [Codex](https://github.com/openai/codex)
-- [GitHub Copilot](https://github.com/features/copilot/cli/)
-- [OpenCode](https://github.com/anomalyco/opencode)
-- [Pi](https://pi.dev)
-
-### 桌面 app（推荐）
-
-从 [paseo.sh/download](https://paseo.sh/zh-CN/download) 或 [GitHub releases 页面](https://github.com/getpaseo/paseo/releases)下载。打开 app 后 daemon 会自动启动，不需要再安装其他东西。
-
-如果要从手机连接，在 Settings 中扫描显示的二维码。
 
 ### CLI / 无头模式
 
@@ -105,116 +109,17 @@ paseo
 你能在 app 中完成的事情，也都可以在终端中完成。
 
 ```bash
-paseo run --provider claude/opus-4.6 "implement user authentication"
+paseo run --provider zcode/glm-5.3 "在 Windows 桌面上打开浏览器并检查本地服务状态"
 paseo run --provider codex/gpt-5.4 --worktree feature-x "implement feature X"
+paseo run --provider antigravity "audit the codebase"
+paseo run --provider dsh "optimize algorithm performance"
 
 paseo ls                           # 列出正在运行的 agents
 paseo attach abc123                # 实时流式查看输出
 paseo send abc123 "also add tests" # 发送后续任务
 
-# 在远程 daemon 上运行
-paseo --host workstation.local:6767 run "run the full test suite"
-```
-
-更多内容见[完整 CLI 参考](https://paseo.sh/zh-CN/docs/cli)。
-
-## Skills
-
-Skills 会教你的 agent 使用 Paseo 来编排其他 agents。
-
-```bash
-npx skills add getpaseo/paseo
-```
-
-然后在任意 agent 对话中使用：
-
-- `/paseo-handoff` — 在 agents 之间交接工作。我会用它先和 Claude 规划，再交给 Codex 实现。
-- `/paseo-advisor` — 启动单个 agent 作为 advisor，提供第二意见，但不把工作委托出去。
-- `/paseo-committee` — 组建两个风格互补的 agents，让它们后退一步做根因分析并产出计划。
-
-## 开发
-
-Monorepo 包结构速览：
-
-- `packages/server`：Paseo daemon（agent 进程编排、WebSocket API、MCP server）
-- `packages/app`：Expo 客户端（iOS、Android、Web）
-- `packages/cli`：用于 daemon 和 agent 工作流的 `paseo` CLI
-- `packages/desktop`：Electron 桌面 app
-- `packages/relay`：用于远程连接的 relay 包
-- `packages/website`：营销站点和文档（`paseo.sh`）
-
-常用命令：
-
-```bash
-# 运行所有本地开发服务
-npm run dev
-
-# 单独运行某个界面
-npm run dev:server
-npm run dev:app
-npm run dev:desktop
-npm run dev:website
-
-# 构建 server stack
-npm run build:server
-
-# 全仓库检查
-npm run typecheck
-```
-
-## 支持 Paseo
-
-Paseo 由一个人开发，靠使用它的人来资助。你可以通过 [GitHub Sponsors](https://github.com/sponsors/boudra) 支持这项工作。公司也可以按月[赞助 Paseo](https://paseo.sh/zh-CN/sponsor#spot)，logo 会展示在本 README 顶部，以及 paseo.sh 的首页和文档中。
-
-## 相关项目
-
-- [getpaseo/paseo-relay](https://github.com/getpaseo/paseo-relay) — 官方分布式 relay，使用 Elixir 编写
-- [paseo-vscode](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode) — VS Code 扩展
-
-### 自托管 relay TLS
-
-自托管 relay 默认使用 `ws://`，除非显式启用 TLS。对于 nginx 后面、监听 443 的 relay，可以这样启动 daemon：
-
-```bash
-PASEO_RELAY_ENDPOINT=127.0.0.1:8080 \
-PASEO_RELAY_PUBLIC_ENDPOINT=relay.example.com:443 \
-PASEO_RELAY_USE_TLS=true \
-paseo daemon start
-```
-
-等价配置：
-
-```json
-{
-  "daemon": {
-    "relay": {
-      "enabled": true,
-      "endpoint": "127.0.0.1:8080",
-      "publicEndpoint": "relay.example.com:443",
-      "useTls": true
-    }
-  }
-}
-```
-
-最小 nginx WebSocket 代理配置：
-
-```nginx
-server {
-  listen 443 ssl;
-  server_name relay.example.com;
-
-  ssl_certificate /etc/letsencrypt/live/relay.example.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
-
-  location /ws {
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_set_header Host $host;
-  }
-}
+# 在远程 NetBird 节点 daemon 上运行
+paseo --host 100.119.1.10:6767 run --provider zcode/glm-5.3 "run Windows GUI regression suite"
 ```
 
 ## License

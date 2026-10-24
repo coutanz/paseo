@@ -8,6 +8,7 @@ export const builtinPlugins = [
   "codex-usage-source",
   "copilot-usage-source",
   "cursor-usage-source",
+  "dsh-provider",
   "grok-usage-source",
   "hoplite-provider",
   "kimi-usage-source",
@@ -15,6 +16,7 @@ export const builtinPlugins = [
   "muse-provider",
   "opencode-go-usage-source",
   "zai-usage-source",
+  "zcode-provider",
 ] as const;
 
 export function resolveBuiltinPluginsRoot(moduleUrl: string | URL = import.meta.url): string {

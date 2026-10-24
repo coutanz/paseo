@@ -157,6 +157,17 @@ const CATALOG_DATA = [
     command: ["npx", "-y", "dirac-cli@0.5.23", "--acp"],
   },
   {
+    id: "dsh",
+    bundledProvider: true,
+    title: "DeepSeek DSH",
+    description:
+      "DeepSeek Harness CLI (`dsh`) with Cordis modular plugin architecture and native ACP server mode",
+    version: "manual",
+    iconId: "codewhale",
+    installLink: "https://github.com/deepseek-ai",
+    command: ["dsh", "acp"],
+  },
+  {
     id: "factory-droid",
     title: "Factory Droid",
     description: "Factory Droid - AI coding agent powered by Factory AI",
@@ -390,6 +401,17 @@ const CATALOG_DATA = [
       VT_ACP_ENABLED: "1",
       VT_ACP_ZED_ENABLED: "1",
     },
+  },
+  {
+    id: "zcode",
+    bundledProvider: true,
+    title: "ZCode (GLM)",
+    description:
+      "Z.AI official ZCode CLI & Agentic Development Environment for GLM-5.3 with native MCP and Windows Computer Use support",
+    version: "manual",
+    iconId: "glm-acp-agent",
+    installLink: "https://z.ai",
+    command: ["zcode"],
   },
 ] as const;
 

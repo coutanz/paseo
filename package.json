@@ -2,23 +2,28 @@
   "name": "paseo",
   "version": "0.13.0",
   "private": true,
-  "description": "Paseo: voice-controlled development environment for local AI coding agents",
+  "description": "Paseo (Omni Edition): unified multi-host environment for ZCode, Codex, Antigravity, and DeepSeek DSH with Windows Computer Use",
   "keywords": [
     "development",
     "mcp",
     "openai",
+    "zcode",
+    "antigravity",
+    "deepseek",
+    "computer-use",
+    "netbird",
     "voice",
     "voice-assistant"
   ],
-  "homepage": "https://paseo.sh",
+  "homepage": "https://github.com/coutanz/paseo",
   "license": "Apache-2.0",
   "author": {
-    "name": "Mohamed Boudra",
+    "name": "Mohamed Boudra & coutanz",
     "email": "hello@moboudra.com"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/getpaseo/paseo.git"
+    "url": "https://github.com/coutanz/paseo.git"
   },
   "workspaces": [
     "plugins",
@@ -35,6 +40,10 @@
     "packages/cli"
   ],
   "scripts": {
+    "omni:sync-mcp": "node scripts/sync-computer-use-mcp.mjs",
+    "omni:setup:win": "powershell -ExecutionPolicy Bypass -File ./scripts/setup-windows-node.ps1",
+    "omni:setup:mac": "bash ./scripts/setup-mac-node.sh",
+    "omni:swarm-mcp": "node scripts/omni-swarm-mcp.mjs",
     "dev": "npm run dev:server",
     "dev:win": "powershell ./scripts/dev.ps1",
     "dev:server": "cross-env PASEO_LISTEN=127.0.0.1:6768 ./scripts/dev-daemon.sh",
