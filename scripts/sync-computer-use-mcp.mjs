@@ -16,10 +16,12 @@ import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const isWin = process.platform === "win32";
 const homeDir = os.homedir();
-const localAppData = process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const acpBridgePath = path.join(scriptDir, "omni-acp-bridge.mjs");
 const npxBin = isWin ? "npx.cmd" : "npx";
 const uvxBin = isWin ? "uvx.exe" : "uvx";
 
@@ -241,91 +243,52 @@ async function syncCodexToml(opts, mcpServers, dryRun) {
   console.log(`[ok] Updated ${filePath}`);
 }
 
-function detectLocalProviderCommands() {
-  const detected = {};
-  if (!isWin) return detected;
-
-  const zcodeCjs = path.join(localAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
-  if (existsSync(zcodeCjs)) {
-    detected.zcode = ["node", zcodeCjs];
-  }
-
-  const dshCandidates = [
-    "E:\\DSH\\resources\\runtime\\cli\\bin\\dsh.cmd",
-    "C:\\DSH\\resources\\runtime\\cli\\bin\\dsh.cmd",
-    path.join(localAppData, "Programs", "DSH", "resources", "runtime", "cli", "bin", "dsh.cmd"),
-  ];
-  for (const candidate of dshCandidates) {
-    if (existsSync(candidate)) {
-      detected.dsh = [candidate];
-      break;
-    }
-  }
-
-  const agyExe = path.join(localAppData, "agy", "bin", "agy.exe");
-  if (existsSync(agyExe)) {
-    detected.antigravity = [agyExe];
-  }
-
-  return detected;
-}
-
 async function syncPaseoDaemonConfig(dryRun) {
   const paseoHome = process.env.PASEO_HOME || path.join(homeDir, ".paseo");
   const filePath = path.join(paseoHome, "config.json");
   const current = await readJsonSafe(filePath);
-  const detectedCommands = detectLocalProviderCommands();
+  const nodeExe = process.execPath;
 
   current.version = current.version ?? 1;
   current.agents = current.agents ?? {};
   current.agents.providers = current.agents.providers ?? {};
 
-  // 1. Codex: enable Computer Use, Browser Use, JS REPL, and Full Access
-  const codexCfg = current.agents.providers.codex ?? {};
-  codexCfg.enabled = codexCfg.enabled ?? true;
-  codexCfg.options = {
-    approval_policy: "never",
-    sandbox_mode: "danger-full-access",
-    ...(codexCfg.options || {}),
-    features: {
-      js_repl: true,
-      computer_use: true,
-      browser_use: true,
-      plugins: true,
-      ...(codexCfg.options?.features || {}),
+  // 1. Codex: enable Full Access (features are configured in ~/.codex/config.toml
+  // so both Paseo 0.10.x and 0.13.x validate config.json cleanly)
+  current.agents.providers.codex = {
+    enabled: true,
+    options: {
+      approval_policy: "never",
+      sandbox_mode: "danger-full-access",
     },
   };
-  current.agents.providers.codex = codexCfg;
 
-  // 2. Antigravity (`agy`)
-  const agyCfg = {
+  // 2. Antigravity (`agy`) via Universal ACP Stdio Bridge (compatible with Paseo 0.10.x & 0.13.x)
+  current.agents.providers.antigravity = {
     enabled: true,
-    ...(current.agents.providers.antigravity || {}),
+    extends: "acp",
+    label: "Antigravity (Google)",
+    description: "Google Antigravity CLI with Windows Computer Use & Browser Use MCP",
+    command: [nodeExe, acpBridgePath, "antigravity"],
   };
-  if (!agyCfg.command && detectedCommands.antigravity) {
-    agyCfg.command = detectedCommands.antigravity;
-  }
-  current.agents.providers.antigravity = agyCfg;
 
-  // 3. GLM ZCode (`zcode`)
-  const zcodeCfg = {
+  // 3. GLM ZCode (`zcode`) via Universal ACP Stdio Bridge
+  current.agents.providers.zcode = {
     enabled: true,
-    ...(current.agents.providers.zcode || {}),
+    extends: "acp",
+    label: "ZCode (GLM)",
+    description: "Z.AI GLM-5.3 ZCode CLI with Windows Computer Use & Browser Use MCP",
+    command: [nodeExe, acpBridgePath, "zcode"],
   };
-  if (!zcodeCfg.command && detectedCommands.zcode) {
-    zcodeCfg.command = detectedCommands.zcode;
-  }
-  current.agents.providers.zcode = zcodeCfg;
 
-  // 4. DeepSeek Harness (`dsh`)
-  const dshCfg = {
+  // 4. DeepSeek Harness (`dsh`) via Universal ACP Stdio Bridge
+  current.agents.providers.dsh = {
     enabled: true,
-    ...(current.agents.providers.dsh || {}),
+    extends: "acp",
+    label: "DeepSeek DSH",
+    description: "DeepSeek V4.1 Harness CLI with Windows Computer Use & Browser Use MCP",
+    command: [nodeExe, acpBridgePath, "dsh"],
   };
-  if (!dshCfg.command && detectedCommands.dsh) {
-    dshCfg.command = detectedCommands.dsh;
-  }
-  current.agents.providers.dsh = dshCfg;
 
   await writeJsonFile(filePath, current, dryRun);
 }
