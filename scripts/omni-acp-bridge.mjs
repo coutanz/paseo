@@ -19,7 +19,9 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import {
   callAntigravityRpc,
+  callDshDesktopConnector,
   discoverAntigravityLanguageServer,
+  discoverDshDesktopConnector,
   getZCodeSessionTitle,
   isAntigravityCliNativeSession,
   isAntigravityDesktopSession,
@@ -31,6 +33,7 @@ import {
   loadCodexHistory,
   loadDshHistory,
   loadZCodeHistory,
+  resolveRealCwdForSession,
   syncZCodeDesktopTaskIndex,
 } from "./omni-session-store.mjs";
 
@@ -346,8 +349,9 @@ function replaySessionHistory(session) {
 function executeCodexCli(session, command, args) {
   return new Promise((resolve, reject) => {
     const { shell } = resolveExecutable("codex-desktop");
+    const execCwd = session.realCwd || session.cwd;
     const child = spawn(command, args, {
-      cwd: session.cwd,
+      cwd: execCwd,
       env: process.env,
       shell,
       stdio: ["ignore", "pipe", "pipe"],
@@ -506,7 +510,8 @@ async function runAntigravityDesktopRpcTurn(session, promptText) {
       15_000,
     );
   } else {
-    const wsUri = pathToFileURL(path.resolve(session.cwd)).href;
+    const execCwd = session.realCwd || session.cwd;
+    const wsUri = pathToFileURL(path.resolve(execCwd)).href;
     const startRes = await callAntigravityRpc(
       "StartCascade",
       {
@@ -618,6 +623,7 @@ async function runAntigravityDesktopRpcTurn(session, promptText) {
 
 async function runAntigravityCliTurn(session, promptText) {
   const { command, baseArgs, shell } = resolveExecutable("antigravity");
+  const execCwd = session.realCwd || session.cwd;
   const args = [
     ...baseArgs,
     "--input-format",
@@ -625,7 +631,7 @@ async function runAntigravityCliTurn(session, promptText) {
     "--output-format",
     "stream-json",
     "--add-dir",
-    session.cwd,
+    execCwd,
     "--disable-slash-commands",
   ];
 
@@ -656,7 +662,7 @@ async function runAntigravityCliTurn(session, promptText) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: session.cwd,
+      cwd: execCwd,
       env: process.env,
       shell,
       stdio: ["pipe", "pipe", "pipe"],
@@ -765,8 +771,31 @@ async function runAntigravityTurn(session, promptText) {
   return runAntigravityCliTurn(session, promptText);
 }
 
+function buildZCodeEnv() {
+  const env = { ...process.env };
+  const builtinCfg = path.join(
+    localAppData,
+    "Programs",
+    "ZCode",
+    "resources",
+    "config",
+    "provider",
+    "zcode-builtin.json",
+  );
+  const personalCfg = path.join(homeDir, ".zcode", "v2", "provider_config.json");
+  if (existsSync(builtinCfg)) {
+    env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtinCfg;
+    env.ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE = builtinCfg;
+  }
+  if (existsSync(personalCfg)) {
+    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = personalCfg;
+  }
+  return env;
+}
+
 async function runZCodeTurn(session, promptText) {
   const { command, baseArgs, shell } = resolveExecutable("zcode");
+  const execCwd = session.realCwd || session.cwd;
   const args = [
     ...baseArgs,
     "-p",
@@ -775,7 +804,7 @@ async function runZCodeTurn(session, promptText) {
     "--surface",
     "desktop",
     "--cwd",
-    session.cwd,
+    execCwd,
     "--mode",
     session.modeId || "yolo",
   ];
@@ -785,8 +814,8 @@ async function runZCodeTurn(session, promptText) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: session.cwd,
-      env: process.env,
+      cwd: execCwd,
+      env: buildZCodeEnv(),
       shell,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -836,7 +865,7 @@ async function runZCodeTurn(session, promptText) {
         // 双向同步回写 `~/.zcode/v2/tasks-index.sqlite`，使 ZCode 桌面端列表立即刷新置顶
         syncZCodeDesktopTaskIndex({
           sessionId: session.backendSessionId,
-          cwd: session.cwd,
+          cwd: execCwd,
           title: promptText,
           mode: session.modeId || "yolo",
           model: session.modelId || "GLM-5.3",
@@ -861,6 +890,45 @@ async function runZCodeTurn(session, promptText) {
 }
 
 async function runDshTurn(session, promptText) {
+  const execCwd = session.realCwd || session.cwd;
+
+  // 1. 优先尝试通过 `@paseo-omni/dsh-desktop-connector` Cordis 插件直连运行中的 DSH 桌面端 App
+  if (discoverDshDesktopConnector()) {
+    try {
+      const rpcRes = await callDshDesktopConnector(
+        "session/prompt",
+        {
+          sessionId: session.backendSessionId,
+          cwd: execCwd,
+          promptText,
+          modelId: session.modelId,
+        },
+        {
+          onStream(evt) {
+            if (evt.kind === "thinking" && evt.text) {
+              sendSessionUpdate(session.id, {
+                sessionUpdate: "agent_thought_chunk",
+                content: { type: "text", text: evt.text },
+              });
+            } else if (evt.kind === "text" && evt.text) {
+              sendSessionUpdate(session.id, {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: evt.text },
+              });
+            }
+          },
+        },
+      );
+      if (rpcRes?.sessionId) {
+        session.backendSessionId = rpcRes.sessionId;
+      }
+      return { stopReason: rpcRes?.stopReason || "end_turn" };
+    } catch {
+      // 若 DSH 桌面端已关闭或未连接，自动回退到 DSH CLI 模式
+    }
+  }
+
+  // 2. 回退方案：调用本机 `dsh.cmd` 原地续接 `.jsonl.zstd` 会话
   const { command, baseArgs, shell } = resolveExecutable("dsh");
   const args = [...baseArgs, "--profile", "headless", "--json"];
   if (session.backendSessionId) {
@@ -870,7 +938,7 @@ async function runDshTurn(session, promptText) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: session.cwd,
+      cwd: execCwd,
       env: process.env,
       shell,
       stdio: ["ignore", "pipe", "pipe"],
@@ -985,9 +1053,11 @@ async function handleRequest(msg) {
 
     case "session/new": {
       const sessionId = randomUUID();
+      const rawCwd = params?.cwd || process.cwd();
       const session = {
         id: sessionId,
-        cwd: params?.cwd || process.cwd(),
+        cwd: rawCwd,
+        realCwd: resolveRealCwdForSession(targetProvider, null, rawCwd),
         modelId: catalog.defaultModel,
         modeId: catalog.defaultMode,
         backendSessionId: null,
@@ -1011,9 +1081,11 @@ async function handleRequest(msg) {
       const sessionId = params?.sessionId || randomUUID();
       let session = sessions.get(sessionId);
       if (!session) {
+        const rawCwd = params?.cwd || process.cwd();
         session = {
           id: sessionId,
-          cwd: params?.cwd || process.cwd(),
+          cwd: rawCwd,
+          realCwd: resolveRealCwdForSession(targetProvider, sessionId, rawCwd),
           modelId: catalog.defaultModel,
           modeId: catalog.defaultMode,
           backendSessionId: sessionId,
@@ -1075,9 +1147,11 @@ async function handleRequest(msg) {
       const sessionId = params?.sessionId;
       let session = sessions.get(sessionId);
       if (!session) {
+        const rawCwd = process.cwd();
         session = {
           id: sessionId || randomUUID(),
-          cwd: process.cwd(),
+          cwd: rawCwd,
+          realCwd: resolveRealCwdForSession(targetProvider, sessionId, rawCwd),
           modelId: catalog.defaultModel,
           modeId: catalog.defaultMode,
           backendSessionId: sessionId || null,
@@ -1121,6 +1195,11 @@ async function handleRequest(msg) {
             5000,
           ).catch(() => {});
         }
+        if (targetProvider === "dsh" && session.backendSessionId && discoverDshDesktopConnector()) {
+          callDshDesktopConnector("session/cancel", { sessionId: session.backendSessionId }).catch(
+            () => {},
+          );
+        }
       }
       if (id !== undefined) sendResult(id, {});
       return;
@@ -1139,6 +1218,11 @@ async function handleRequest(msg) {
             { cascadeId: session.activeCascadeId },
             5000,
           ).catch(() => {});
+        }
+        if (targetProvider === "dsh" && session.backendSessionId && discoverDshDesktopConnector()) {
+          callDshDesktopConnector("session/cancel", { sessionId: session.backendSessionId }).catch(
+            () => {},
+          );
         }
       }
       sessions.delete(params?.sessionId);

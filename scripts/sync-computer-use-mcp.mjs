@@ -154,6 +154,62 @@ async function syncDshConfig(mcpServers, dryRun) {
     ...mcpServers,
   };
   await writeJsonFile(filePath, current, dryRun);
+
+  // Install @paseo-omni/dsh-desktop-connector into ~/.dsh/profiles/desktop for live App bridge
+  const connectorSrc = path.join(scriptDir, "dsh-paseo-connector.mjs");
+  const desktopProfileDir = path.join(homeDir, ".dsh", "profiles", "desktop");
+  if (!dryRun && existsSync(connectorSrc) && existsSync(desktopProfileDir)) {
+    try {
+      const pkgDir = path.join(
+        desktopProfileDir,
+        "node_modules",
+        "@paseo-omni",
+        "dsh-desktop-connector",
+      );
+      await mkdir(pkgDir, { recursive: true });
+      await copyFile(connectorSrc, path.join(pkgDir, "index.mjs"));
+      const pkgJson = {
+        name: "@paseo-omni/dsh-desktop-connector",
+        version: "1.0.0",
+        type: "module",
+        main: "./index.mjs",
+        exports: "./index.mjs",
+      };
+      await writeFile(path.join(pkgDir, "package.json"), `${JSON.stringify(pkgJson, null, 2)}\n`, "utf8");
+
+      const desktopPatchYml = path.join(desktopProfileDir, "cordis.patch.yml");
+      if (existsSync(desktopPatchYml)) {
+        const ymlText = await readFile(desktopPatchYml, "utf8");
+        const descriptorPath = path.join(homeDir, ".paseo", "dsh-desktop-connector.json");
+        if (!ymlText.includes("@paseo-omni/dsh-desktop-connector")) {
+          await backupOnce(desktopPatchYml, false);
+          const snippet = [
+            "  - id: paseo-omni-dsh-desktop",
+            '    name: "@paseo-omni/dsh-desktop-connector"',
+            "    config:",
+            `      descriptorPath: ${JSON.stringify(descriptorPath)}`,
+          ].join("\n");
+          await writeFile(desktopPatchYml, `${ymlText.trimEnd()}\n${snippet}\n`, "utf8");
+          console.log(`[ok] Injected @paseo-omni/dsh-desktop-connector into ${desktopPatchYml}`);
+        }
+
+        // Also sync model provider config to headless profile if headless cordis.patch.yml is empty
+        const headlessPatchYml = path.join(homeDir, ".dsh", "profiles", "headless", "cordis.patch.yml");
+        if (existsSync(headlessPatchYml)) {
+          const headlessText = await readFile(headlessPatchYml, "utf8");
+          if (headlessText.trim() === "plugins: []") {
+            const cutIdx = ymlText.indexOf("  - id: codexbridge-dsh-desktop");
+            const providerOnlyYml =
+              cutIdx !== -1 ? `${ymlText.slice(0, cutIdx).trimEnd()}\n` : ymlText;
+            await writeFile(headlessPatchYml, providerOnlyYml, "utf8");
+            console.log(`[ok] Synchronized DSH model provider config to ${headlessPatchYml}`);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[warn] Failed to install DSH Desktop Cordis connector:", err);
+    }
+  }
 }
 
 function ensureCodexFeaturesInToml(tomlText) {

@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * Paseo Omni — 全量真实历史会话无损同步与守护监听工具
+ * Paseo Omni — 全量真实历史会话无损同步、官方项目对齐与守护监听工具 (Phase 6)
  *
  * 核心特性：
- *   1. 默认无条数限制（`--limit all` / `Infinity`），一次性将本机四大桌面 Agent：
- *      - OpenAI Codex (`~/.codex/state_5.sqlite` + `session_index.jsonl`)
- *      - Google Antigravity (`~/.gemini/antigravity/conversation_summaries.db` + `transcript_full.jsonl`)
- *      - GLM ZCode (`~/.zcode/v2/tasks-index.sqlite` + `cli/db/db.sqlite`)
- *      - DeepSeek Harness (`~/.dsh/storages/workspace.json` + `session_projcache`)
- *      中的全部活跃用户会话（剔除子代理、已归档与已删除会话）同步进 Paseo。
- *   2. 采用零内存休眠态 (`lastStatus: "closed"`) 原子写入 `~/.paseo/agents/<project>/<id>.json`：
- *      - 即使导入 300+ 条会话也不会拉起任何后台子进程，0 内存膨胀、0 Codex 线程写锁占用；
- *      - 100% 保留每条历史会话真实的原始 `createdAt`、`updatedAt` 与中文标题（纯 UTF-8 无乱码）；
- *      - 当用户在手机端或桌面端点击任意会话时，由 Paseo 按需懒加载 (`ensureAgentLoaded`) 唤醒并回放完整对话。
- *   3. 自动调用 `paseo workspace create --isolation local` 为所有涉及的项目目录注册原生工作区分组。
+ *   1. 官方项目优先映射 + 方式 B 四大客户端自由对话收件箱：
+ *      - 自动读取 Codex 与 ZCode 官方 `projects` / `project_roots` 表，将多子仓库与 Git Worktrees
+ *        （如 `90CN-Server` 各分支工作树、`arad40` 工作树）归并到唯一官方项目（`90CN`、`JP40`、`Citris60` 等）；
+ *      - 将未绑定项目的随手新建会话按客户端归入 4 个专属收件箱项目：
+ *        `Codex 自由对话`、`Antigravity 自由对话`、`ZCode 自由对话`、`DSH 自由对话`；
+ *      - 自动将官方项目名称（`customName` / `displayName`）写入 `~/.paseo/projects/projects.json` 与 `workspaces.json`，
+ *        让 Paseo 左侧栏展示与各客户端 100% 一致的项目名称。
+ *   2. 严苛噪音剔除：
+ *      - 剔除 Codex `source LIKE '%subagent%'`（106 个 `thread_spawn` 子代理 + 18 个 `guardian` 自动审查代理）及 `exec` 任务；
+ *      - 剔除 Antigravity 2 步中断草稿、CLI 测试会话及 `CodexBridgeService` 后台探测任务。
+ *   3. 零内存休眠态 (`lastStatus: "closed"`) 原子落盘 + Windows WMI 独立守护进程拉起。
  *
  * 用法：
  *   node --no-warnings scripts/sync-existing-sessions.mjs [--clean] [--limit all|N] [--watch] [--interval 30]
@@ -31,6 +31,7 @@ import {
   listCodexSessions,
   listDshSessions,
   listZCodeSessions,
+  loadCanonicalProjectCatalog,
 } from "./omni-session-store.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -39,6 +40,7 @@ const homeDir = os.homedir();
 const localAppData = process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
 const paseoHome = process.env.PASEO_HOME || path.join(homeDir, ".paseo");
 const agentsBaseDir = path.join(paseoHome, "agents");
+const projectsJsonPath = path.join(paseoHome, "projects", "projects.json");
 const workspacesJsonPath = path.join(paseoHome, "projects", "workspaces.json");
 const ledgerPath = path.join(paseoHome, "omni-imported-sessions.json");
 
@@ -92,9 +94,6 @@ function parseArgs(argv) {
   return opts;
 }
 
-/**
- * 与 Paseo 服务端 `packages/server/src/server/agent/agent-storage.ts` 中 `projectDirNameFromCwd` 完全一致
- */
 export function projectDirNameFromCwd(cwd) {
   const { root } = path.win32.parse(cwd);
   const withoutRoot = cwd.slice(root.length).replace(/[\\/]+$/, "");
@@ -112,6 +111,10 @@ function writeJsonAtomicSync(filePath, data) {
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   fs.renameSync(tmpPath, filePath);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function resolvePaseoRunner() {
@@ -140,6 +143,7 @@ function resolvePaseoRunner() {
     if (fs.existsSync(appExe) && fs.existsSync(runnerJs)) {
       return {
         exe: appExe,
+        paseoCmd,
         prefixArgs: ["--disable-warning=DEP0040", runnerJs, "node-script", cliIndexJs],
         env: {
           ...process.env,
@@ -155,6 +159,7 @@ function resolvePaseoRunner() {
 
   return {
     exe: "paseo",
+    paseoCmd: "paseo",
     prefixArgs: [],
     env: { ...process.env },
     shell: isWin,
@@ -183,7 +188,7 @@ async function isDaemonRunning(runner) {
       return true;
     }
   } catch {
-    // 尝试用 `ls --json` 二次探测
+    // fallback
   }
   try {
     await runPaseo(runner, ["workspace", "ls", "--json"], 8000);
@@ -193,15 +198,38 @@ async function isDaemonRunning(runner) {
   }
 }
 
-async function ensureDaemonStarted(runner) {
-  if (await isDaemonRunning(runner)) return;
-  console.log("[daemon] 正在启动本地 Paseo Daemon...");
+async function startDaemonDetached(runner) {
+  if (isWin && runner.paseoCmd && fs.existsSync(runner.paseoCmd)) {
+    const cmdLine = `cmd.exe /c ""${runner.paseoCmd}" daemon start"`;
+    const psScript = `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmdLine.replace(/'/g, "''")}'; CurrentDirectory = '${homeDir.replace(/'/g, "''")}' } | Out-Null`;
+    await execFileAsync("powershell", ["-NoProfile", "-Command", psScript], {
+      windowsHide: true,
+      timeout: 15_000,
+    });
+    for (let i = 0; i < 20; i += 1) {
+      await sleep(800);
+      if (await isDaemonRunning(runner)) return;
+    }
+  }
   await runPaseo(runner, ["daemon", "start"], 30_000);
 }
 
-/**
- * 扫描 `~/.paseo/agents` 下所有已持久化的会话记录，建立 `sessionId -> { filePath, record }` 索引
- */
+async function ensureDaemonStarted(runner) {
+  if (await isDaemonRunning(runner)) return;
+  console.log("[daemon] 正在启动本地 Paseo Daemon...");
+  await startDaemonDetached(runner);
+}
+
+async function stopDaemonSafe(runner) {
+  if (!(await isDaemonRunning(runner))) return;
+  try {
+    await runPaseo(runner, ["daemon", "stop"], 20_000);
+  } catch {
+    // ignore
+  }
+  await sleep(800);
+}
+
 function scanStoredOmniRecords() {
   const bySid = new Map();
   if (!fs.existsSync(agentsBaseDir)) return bySid;
@@ -229,11 +257,13 @@ function scanStoredOmniRecords() {
             bySid.set(String(sid), { filePath: fullPath, record });
           }
         } catch {
-          // 若遇到之前命令行编码截断损坏的旧 JSON 文件，记录为可清理项
           try {
             const raw = fs.readFileSync(fullPath, "utf8");
             if (raw.includes('"omni_sid"')) {
-              bySid.set(`__corrupt__:${fullPath}`, { filePath: fullPath, record: { labels: { omni_sid: "corrupt" } } });
+              bySid.set(`__corrupt__:${fullPath}`, {
+                filePath: fullPath,
+                record: { labels: { omni_sid: "corrupt" } },
+              });
             }
           } catch {
             // ignore
@@ -248,15 +278,8 @@ function scanStoredOmniRecords() {
 }
 
 async function cleanExistingOmniRecords(runner) {
-  const running = await isDaemonRunning(runner);
-  if (running) {
-    console.log("[clean] 暂停 Paseo Daemon 以清理旧会话索引...");
-    try {
-      await runPaseo(runner, ["daemon", "stop"], 20_000);
-    } catch {
-      // ignore
-    }
-  }
+  console.log("[clean] 暂停 Paseo Daemon 以彻底清理旧工作区与会话索引...");
+  await stopDaemonSafe(runner);
 
   let removedFiles = 0;
   if (fs.existsSync(agentsBaseDir)) {
@@ -274,11 +297,8 @@ async function cleanExistingOmniRecords(runner) {
           }
         } else if (entry.isFile() && entry.name.endsWith(".json")) {
           try {
-            const raw = fs.readFileSync(fullPath, "utf8");
-            if (raw.includes('"omni_sid"')) {
-              fs.unlinkSync(fullPath);
-              removedFiles += 1;
-            }
+            fs.unlinkSync(fullPath);
+            removedFiles += 1;
           } catch {
             // ignore
           }
@@ -288,6 +308,10 @@ async function cleanExistingOmniRecords(runner) {
     cleanDir(agentsBaseDir);
   }
 
+  // 重置 projects.json 与 workspaces.json，彻底清除此前散落创建的 40 个临时目录项目
+  writeJsonAtomicSync(projectsJsonPath, []);
+  writeJsonAtomicSync(workspacesJsonPath, []);
+
   if (fs.existsSync(ledgerPath)) {
     try {
       fs.unlinkSync(ledgerPath);
@@ -296,7 +320,7 @@ async function cleanExistingOmniRecords(runner) {
     }
   }
 
-  console.log(`[clean] 已清理 ${removedFiles} 条旧导入会话记录。`);
+  console.log(`[clean] 已清理 ${removedFiles} 条旧会话记录及全部散乱项目缓存。`);
 }
 
 function readWorkspaceMapFromDisk() {
@@ -349,7 +373,7 @@ async function provisionWorkspacesForCwds(runner, cwds) {
     return wsMap;
   }
 
-  console.log(`[workspace] 正在为 ${missingCwds.length} 个项目目录注册 Paseo 本地工作区...`);
+  console.log(`[workspace] 正在为 ${missingCwds.length} 个官方项目与自由对话收件箱注册 Paseo 工作区...`);
   const concurrency = 4;
   let index = 0;
 
@@ -387,7 +411,7 @@ async function provisionWorkspacesForCwds(runner, cwds) {
           wsMap.set(norm, String(wsId));
         }
       } catch {
-        // 个别目录若属于同一仓库已存在工作区，后续通过读取 workspaces.json 兜底匹配
+        // ignore
       }
     }
   };
@@ -401,10 +425,69 @@ async function provisionWorkspacesForCwds(runner, cwds) {
   return wsMap;
 }
 
+/**
+ * 将官方项目名称（如 `90CN`、`JP40`、`Citris60`、`Codex 自由对话`）同步写入 Paseo 的
+ * `projects.json` (`customName` + `displayName`) 与 `workspaces.json` (`title` + `displayName`)
+ */
+function applyCanonicalProjectDisplayNames(cwdToProjectNameMap) {
+  if (!fs.existsSync(workspacesJsonPath) || !fs.existsSync(projectsJsonPath)) {
+    return false;
+  }
+
+  let modified = false;
+  try {
+    const workspaces = JSON.parse(fs.readFileSync(workspacesJsonPath, "utf8"));
+    const projects = JSON.parse(fs.readFileSync(projectsJsonPath, "utf8"));
+    if (!Array.isArray(workspaces) || !Array.isArray(projects)) return false;
+
+    const projectIdToDesiredName = new Map();
+
+    for (const ws of workspaces) {
+      if (!ws?.cwd) continue;
+      const normCwd = path.resolve(ws.cwd).toLowerCase();
+      const desiredName = cwdToProjectNameMap.get(normCwd);
+      if (!desiredName) continue;
+
+      projectIdToDesiredName.set(ws.projectId, desiredName);
+      if (ws.displayName !== desiredName || ws.title !== desiredName) {
+        ws.displayName = desiredName;
+        ws.title = desiredName;
+        modified = true;
+      }
+    }
+
+    for (const proj of projects) {
+      const normRoot = proj?.rootPath ? path.resolve(proj.rootPath).toLowerCase() : "";
+      const desiredName =
+        projectIdToDesiredName.get(proj.projectId) || cwdToProjectNameMap.get(normRoot);
+      if (!desiredName) continue;
+
+      if (proj.displayName !== desiredName || proj.customName !== desiredName) {
+        proj.displayName = desiredName;
+        proj.customName = desiredName;
+        modified = true;
+      }
+    }
+
+    if (modified) {
+      writeJsonAtomicSync(workspacesJsonPath, workspaces);
+      writeJsonAtomicSync(projectsJsonPath, projects);
+    }
+  } catch {
+    // ignore
+  }
+  return modified;
+}
+
 function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
   const createdAt = item.createdAt || item.updatedAt || new Date().toISOString();
   const updatedAt = item.updatedAt || createdAt;
   const title = item.title || item.sessionId;
+  const labels = {
+    omni_sid: item.sessionId,
+    ...(item.projectName ? { omni_project: item.projectName } : {}),
+    ...(item.realCwd ? { omni_real_cwd: item.realCwd } : {}),
+  };
 
   if (item.provider === "codex") {
     const model = item.model || "gpt-5.4";
@@ -418,9 +501,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
       lastActivityAt: updatedAt,
       lastUserMessageAt: updatedAt,
       title,
-      labels: {
-        omni_sid: item.sessionId,
-      },
+      labels,
       lastStatus: "closed",
       lastModeId: "auto",
       config: {
@@ -477,9 +558,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
     lastActivityAt: updatedAt,
     lastUserMessageAt: updatedAt,
     title,
-    labels: {
-      omni_sid: item.sessionId,
-    },
+    labels,
     lastStatus: "closed",
     lastModeId: defaults.modeId,
     config: {
@@ -582,19 +661,43 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
 
   if (opts.dryRun) {
     const byProv = {};
+    const byProj = {};
     let pending = 0;
     for (const item of candidates) {
       byProv[item.provider] = (byProv[item.provider] || 0) + 1;
+      byProj[item.projectName] = (byProj[item.projectName] || 0) + 1;
       if (!existingBySid.has(item.sessionId)) pending += 1;
     }
     console.log(`[dry-run] 扫描到活跃会话共 ${candidates.length} 条:`, byProv, `(待新增 ${pending} 条)`);
+    console.log(`[dry-run] 归属项目分布 (${Object.keys(byProj).length} 个项目):`, byProj);
     return pending;
   }
 
   await ensureDaemonStarted(runner);
 
-  // 收集本次待导入或待补齐工作区的所有项目目录
-  const uniqueCwds = [...new Set(candidates.map((c) => path.resolve(c.cwd)))];
+  // 收集本次涉及的官方项目目录（含尚无会话但已在客户端注册的官方空项目）与方式 B 自由对话收件箱目录
+  const cwdToProjectNameMap = new Map();
+  const catalog = loadCanonicalProjectCatalog();
+  for (const proj of catalog.projectsByNameLower.values()) {
+    if (proj.primaryCwd && fs.existsSync(proj.primaryCwd)) {
+      cwdToProjectNameMap.set(path.resolve(proj.primaryCwd).toLowerCase(), proj.name);
+    }
+  }
+  for (const c of candidates) {
+    const norm = path.resolve(c.cwd).toLowerCase();
+    if (c.projectName) {
+      cwdToProjectNameMap.set(norm, c.projectName);
+    }
+  }
+  const uniqueCwds = [
+    ...new Set([
+      ...[...catalog.projectsByNameLower.values()]
+        .map((p) => p.primaryCwd)
+        .filter((p) => p && fs.existsSync(p))
+        .map((p) => path.resolve(p)),
+      ...candidates.map((c) => path.resolve(c.cwd)),
+    ]),
+  ];
   const wsMap = await provisionWorkspacesForCwds(runner, uniqueCwds);
 
   let createdCount = 0;
@@ -619,24 +722,43 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
       writeJsonAtomicSync(targetFile, record);
       createdCount += 1;
     } else if (existing.record?.lastStatus === "closed") {
-      // 对休眠态已导入会话同步刷新标题、最新活跃时间与缺失的 workspaceId
       const rec = existing.record;
       const nextUpdated =
         Date.parse(item.updatedAt) > Date.parse(rec.updatedAt || "")
           ? item.updatedAt
           : rec.updatedAt;
       const needTitleFix = item.title && rec.title !== item.title;
-      const needWsFix = workspaceId && !rec.workspaceId;
+      const needWsFix = workspaceId && rec.workspaceId !== workspaceId;
+      const needCwdFix = path.resolve(rec.cwd || "") !== path.resolve(item.cwd);
       const needTimeFix = nextUpdated !== rec.updatedAt;
 
-      if (needTitleFix || needWsFix || needTimeFix) {
+      if (needTitleFix || needWsFix || needCwdFix || needTimeFix) {
         const nextRec = {
           ...rec,
+          cwd: item.cwd,
+          ...(workspaceId ? { workspaceId } : {}),
           ...(needTitleFix ? { title: item.title } : {}),
-          ...(needWsFix ? { workspaceId } : {}),
           ...(needTimeFix ? { updatedAt: nextUpdated, lastActivityAt: nextUpdated } : {}),
+          labels: {
+            ...(rec.labels || {}),
+            omni_sid: item.sessionId,
+            ...(item.projectName ? { omni_project: item.projectName } : {}),
+            ...(item.realCwd ? { omni_real_cwd: item.realCwd } : {}),
+          },
         };
-        writeJsonAtomicSync(existing.filePath, nextRec);
+        const targetFile = path.join(
+          agentsBaseDir,
+          projectDirNameFromCwd(nextRec.cwd),
+          `${nextRec.id}.json`,
+        );
+        if (existing.filePath !== targetFile && fs.existsSync(existing.filePath)) {
+          try {
+            fs.unlinkSync(existing.filePath);
+          } catch {
+            // ignore
+          }
+        }
+        writeJsonAtomicSync(targetFile, nextRec);
         updatedCount += 1;
       }
     }
@@ -648,13 +770,22 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
     const busy = await hasRunningLiveAgent(runner);
     if (!busy) {
       console.log(
-        `[reload] 已写入新增 ${createdCount} 条 / 刷新 ${updatedCount} 条会话，正在重启 Daemon Worker 加载索引...`,
+        `[reload] 已写入新增 ${createdCount} 条 / 刷新 ${updatedCount} 条会话，正在同步项目自定义名称并重启 Daemon...`,
       );
-      await runPaseo(runner, ["daemon", "restart"], 30_000);
+      await stopDaemonSafe(runner);
+      applyCanonicalProjectDisplayNames(cwdToProjectNameMap);
+      await startDaemonDetached(runner);
     } else {
+      applyCanonicalProjectDisplayNames(cwdToProjectNameMap);
       console.log(
-        `[reload] 已写入新增 ${createdCount} 条 / 刷新 ${updatedCount} 条会话（当前有运行中任务，跳过热重启以避免中断）。`,
+        `[reload] 已写入新增 ${createdCount} 条 / 刷新 ${updatedCount} 条会话（当前有运行中任务，跳过重启以避免中断）。`,
       );
+    }
+  } else {
+    const nameChanged = applyCanonicalProjectDisplayNames(cwdToProjectNameMap);
+    if (nameChanged && !(await hasRunningLiveAgent(runner))) {
+      await stopDaemonSafe(runner);
+      await startDaemonDetached(runner);
     }
   }
 
@@ -665,7 +796,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const runner = resolvePaseoRunner();
 
-  console.log("=== Paseo Omni: 全量本地真实会话清洗与同步 ===");
+  console.log("=== Paseo Omni: 官方项目对齐与全量会话同步 (Phase 6) ===");
   const count = await syncOnce(opts, runner, { allowClean: true });
   const totalStored = scanStoredOmniRecords().size;
   console.log(`=== 同步完成（本次新增 ${count} 条，当前 Paseo 共纳管 ${totalStored} 条真实会话） ===`);

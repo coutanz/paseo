@@ -1,23 +1,31 @@
 /**
- * Paseo Omni — 四大桌面 Agent 官方索引源发现、无损历史提取与本地双向同步核心模块
+ * Paseo Omni — 四大桌面 Agent 官方项目目录映射、App 级原生直连与无损历史提取核心模块
  *
- * 数据源与清洗策略：
- *   1. OpenAI Codex：读取 `~/.codex/state_5.sqlite` (`threads` 表) + `~/.codex/session_index.jsonl`，
- *      排除归档会话与子代理 (`agent_role IS NULL`)，剥离剪贴板贴图临时路径前缀并还原真实中文标题。
- *   2. Google Antigravity：读取 `~/.gemini/antigravity/conversation_summaries.db` 与
- *      `~/.gemini/antigravity-cli/conversation_summaries.db` (`parent_conversation_id = ''`)，
- *      改读未截断的 `transcript_full.jsonl`（仅保留 `USER_EXPLICIT` 输入与每轮最终答复），
- *      并提供本机 `language_server` ConnectRPC 动态发现与双向通信辅助函数。
- *   3. GLM ZCode：关联 `~/.zcode/v2/tasks-index.sqlite`（过滤桌面端已删除/已归档任务）与
- *      `~/.zcode/cli/db/db.sqlite`（按 `semantics.origin === "real_user"` 与 `finish === "stop"` 提纯对话），
- *      支持在 Paseo 对话后双向回写 `tasks-index.sqlite`。
- *   4. DeepSeek Harness (DSH)：读取 `~/.dsh/storages/workspace.json` + `session_projcache/sessions/*.json`
- *      （过滤已归档会话、空会话与子代理），从 `session.v4.jsonl.zstd` 按 `source.kind === "user"` 无损提取问答轮次。
+ * 核心能力（Phase 6 — Project-First + Option B 自由对话收件箱 + 原生 App 桥接）：
+ *   1. 官方项目优先映射 (`loadCanonicalProjectCatalog` + `resolveSessionProjectPlacement`)：
+ *      - 严格读取 Codex (`~/.codex/.codex-global-state.json` + `state_5.sqlite`) 与
+ *        ZCode (`~/.zcode/v2/tasks-index.sqlite`) 的官方 `projects` / `project_roots` 注册表；
+ *      - 自动将多子仓库（如 `90CN-Server`、`90CN-ClientPatch`、`90CN-PVF`）与 Git Worktrees
+ *        （如 `worktrees/* /90CN-Server`、`worktrees/* /arad40`）归并到唯一主项目（`90CN`、`JP40` 等）；
+ *      - 采用方式 B：所有未绑定项目的随手新建会话（`new-chat*`、`draft-*`、`default-workspace` 等）
+ *        按客户端归入 4 个专属收件箱项目：`Codex 自由对话`、`Antigravity 自由对话`、`ZCode 自由对话`、`DSH 自由对话`，
+ *        同时保留每条会话的 `realCwd` 供续接对话时在原目录执行工具。
+ *   2. 严苛噪音与子代理过滤：
+ *      - Codex：剔除 `source LIKE '%subagent%'`（含 106 个 `thread_spawn` 子代理与 18 个 `guardian` 自动审查子代理）、
+ *        `source = 'exec'` 脚本任务以及 `CodexBridgeService` 后台探测会话；
+ *      - Antigravity：仅纳管桌面端真实会话，剔除 `antigravity-cli`、空会话与后台探测会话；
+ *      - ZCode & DSH：严格对齐桌面端 `tasks-index.sqlite` 与 `session_projcache`。
+ *   3. 原生 App 直连辅助：
+ *      - Antigravity Desktop ConnectRPC (`discoverAntigravityLanguageServer` / `callAntigravityRpc`)
+ *      - DSH Desktop Cordis 进程内直连 (`discoverDshDesktopConnector` / `callDshDesktopConnector`)
+ *      - ZCode Desktop Provider Config 环境变量解析与 `tasks-index.sqlite` 双向回写
  */
 
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,6 +34,15 @@ import zlib from "node:zlib";
 
 const isWin = process.platform === "win32";
 const homeDir = os.homedir();
+const paseoHome = process.env.PASEO_HOME || path.join(homeDir, ".paseo");
+
+export const CLIENT_INBOX_NAMES = {
+  codex: "Codex 自由对话",
+  "codex-desktop": "Codex 自由对话",
+  antigravity: "Antigravity 自由对话",
+  zcode: "ZCode 自由对话",
+  dsh: "DSH 自由对话",
+};
 
 export function stripWinExtendedPrefix(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return "";
@@ -62,6 +79,20 @@ export function ensureExistingDir(candidate) {
   return homeDir;
 }
 
+export function getClientInboxProject(provider) {
+  const inboxName = CLIENT_INBOX_NAMES[provider] || CLIENT_INBOX_NAMES.codex;
+  const inboxDir = path.join(paseoHome, "inboxes", inboxName);
+  try {
+    fs.mkdirSync(inboxDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+  return {
+    projectName: inboxName,
+    projectCwd: path.resolve(inboxDir),
+  };
+}
+
 function normalizeIsoTimestamp(value, fallbackMs = Date.now()) {
   if (value === null || value === undefined || value === "") {
     return new Date(fallbackMs).toISOString();
@@ -88,11 +119,349 @@ function normalizeIsoTimestamp(value, fallbackMs = Date.now()) {
   return new Date(fallbackMs).toISOString();
 }
 
+function findLatestCodexStateDb() {
+  const codexRoot = path.join(homeDir, ".codex");
+  if (!fs.existsSync(codexRoot)) return null;
+  const candidates = fs
+    .readdirSync(codexRoot)
+    .filter((f) => /^state_\d+\.sqlite$/i.test(f))
+    .map((f) => {
+      const ver = Number.parseInt(f.match(/\d+/)?.[0] || "0", 10);
+      return { ver, fullPath: path.join(codexRoot, f) };
+    })
+    .sort((a, b) => b.ver - a.ver);
+  return candidates[0]?.fullPath || null;
+}
+
+// ============================================================================
+// 官方项目注册表与方式 B 自由对话收件箱映射 (`loadCanonicalProjectCatalog`)
+// ============================================================================
+let cachedCatalog = null;
+let cachedCatalogAt = 0;
+
+export function loadCanonicalProjectCatalog({ forceRefresh = false } = {}) {
+  if (!forceRefresh && cachedCatalog && Date.now() - cachedCatalogAt < 10_000) {
+    return cachedCatalog;
+  }
+
+  const projectsById = new Map();
+  const projectsByNameLower = new Map();
+  const codexThreadAssignments = new Map();
+  const codexProjectlessSet = new Set();
+
+  const registerCanonicalProject = ({ id, name, rootPaths }) => {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    const validRoots = [];
+    for (const rp of rootPaths || []) {
+      const stripped = stripWinExtendedPrefix(String(rp || "").trim());
+      if (stripped) validRoots.push(path.resolve(stripped));
+    }
+    if (validRoots.length === 0) return;
+
+    // 优先选择磁盘上实际存在的首个根目录作为 Paseo 工作区主路径
+    const existingRoot = validRoots.find((r) => {
+      try {
+        return fs.existsSync(r) && fs.statSync(r).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+    const primaryCwd = existingRoot || validRoots[0];
+    const keyLower = cleanName.toLowerCase();
+
+    const existing = projectsByNameLower.get(keyLower);
+    if (existing) {
+      for (const r of validRoots) {
+        if (!existing.rootPaths.some((er) => er.toLowerCase() === r.toLowerCase())) {
+          existing.rootPaths.push(r);
+        }
+      }
+      if (!fs.existsSync(existing.primaryCwd) && existingRoot) {
+        existing.primaryCwd = existingRoot;
+      }
+      if (id) projectsById.set(String(id), existing);
+      return;
+    }
+
+    const record = {
+      id: id ? String(id) : `proj-${keyLower}`,
+      name: cleanName,
+      primaryCwd,
+      rootPaths: validRoots,
+    };
+    projectsByNameLower.set(keyLower, record);
+    if (id) projectsById.set(String(id), record);
+  };
+
+  // 1. 读取 Codex `.codex-global-state.json`
+  const codexGlobalJson = path.join(homeDir, ".codex", ".codex-global-state.json");
+  if (fs.existsSync(codexGlobalJson)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(codexGlobalJson, "utf8"));
+      const rawLocalProjects = parsed?.["local-projects"];
+      const localProjects = Array.isArray(rawLocalProjects)
+        ? rawLocalProjects
+        : rawLocalProjects && typeof rawLocalProjects === "object"
+          ? Object.values(rawLocalProjects)
+          : [];
+      for (const lp of localProjects) {
+        if (lp?.id && lp?.name && Array.isArray(lp?.rootPaths)) {
+          registerCanonicalProject({
+            id: lp.id,
+            name: lp.name,
+            rootPaths: lp.rootPaths,
+          });
+        }
+      }
+      const assignments = parsed?.["thread-project-assignments"];
+      if (assignments && typeof assignments === "object") {
+        for (const [tid, assign] of Object.entries(assignments)) {
+          if (assign?.projectId) {
+            codexThreadAssignments.set(String(tid), String(assign.projectId));
+          }
+        }
+      }
+      const projectless = parsed?.["projectless-thread-ids"];
+      if (Array.isArray(projectless)) {
+        for (const tid of projectless) {
+          codexProjectlessSet.add(String(tid));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // 2. 读取 Codex `state_5.sqlite` (`projects` + `project_roots`)
+  const codexDbPath = findLatestCodexStateDb();
+  if (codexDbPath && fs.existsSync(codexDbPath)) {
+    let db;
+    try {
+      db = new DatabaseSync(codexDbPath, { open: true, readOnly: true });
+      const projs = db.prepare("SELECT id, name FROM projects ORDER BY position ASC").all();
+      const roots = db
+        .prepare("SELECT project_id, path FROM project_roots ORDER BY position ASC")
+        .all();
+      const rootsByProj = new Map();
+      for (const r of roots) {
+        const pid = String(r.project_id);
+        if (!rootsByProj.has(pid)) rootsByProj.set(pid, []);
+        rootsByProj.get(pid).push(String(r.path));
+      }
+      for (const p of projs) {
+        const pid = String(p.id);
+        registerCanonicalProject({
+          id: pid,
+          name: String(p.name),
+          rootPaths: rootsByProj.get(pid) || [],
+        });
+      }
+    } catch {
+      // ignore
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // 3. 读取 ZCode `~/.zcode/v2/tasks-index.sqlite` (`projects` + `project_roots`)
+  const zcodeTasksDb = path.join(homeDir, ".zcode", "v2", "tasks-index.sqlite");
+  if (fs.existsSync(zcodeTasksDb)) {
+    let db;
+    try {
+      db = new DatabaseSync(zcodeTasksDb, { open: true, readOnly: true });
+      const projs = db
+        .prepare("SELECT project_id, name FROM projects WHERE deleted = 0 ORDER BY position ASC")
+        .all();
+      const roots = db
+        .prepare(
+          "SELECT project_id, root_path FROM project_roots ORDER BY is_primary DESC, position ASC",
+        )
+        .all();
+      const rootsByProj = new Map();
+      for (const r of roots) {
+        const pid = String(r.project_id);
+        if (!rootsByProj.has(pid)) rootsByProj.set(pid, []);
+        rootsByProj.get(pid).push(String(r.root_path));
+      }
+      for (const p of projs) {
+        const pid = String(p.project_id);
+        registerCanonicalProject({
+          id: pid,
+          name: String(p.name),
+          rootPaths: rootsByProj.get(pid) || [],
+        });
+      }
+    } catch {
+      // ignore
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // 构建按路径长度降序排列的根目录前缀匹配表（确保 `E:\client\ARAD40E` 优先于 `E:\client`）
+  const rootPrefixEntries = [];
+  const rootBasenameMap = new Map();
+  for (const proj of projectsByNameLower.values()) {
+    for (const rp of proj.rootPaths) {
+      const norm = path.resolve(rp).toLowerCase();
+      rootPrefixEntries.push({ normRoot: norm, project: proj });
+      const base = path.basename(norm);
+      if (base && !rootBasenameMap.has(base)) {
+        rootBasenameMap.set(base, proj);
+      }
+    }
+  }
+  rootPrefixEntries.sort((a, b) => b.normRoot.length - a.normRoot.length);
+
+  cachedCatalog = {
+    projectsById,
+    projectsByNameLower,
+    rootPrefixEntries,
+    rootBasenameMap,
+    codexThreadAssignments,
+    codexProjectlessSet,
+  };
+  cachedCatalogAt = Date.now();
+  return cachedCatalog;
+}
+
+function isAdhocScratchDirectory(rawPath) {
+  if (!rawPath) return true;
+  const norm = path.resolve(stripWinExtendedPrefix(rawPath)).toLowerCase();
+  const normHome = path.resolve(homeDir).toLowerCase();
+  if (norm === normHome) return true;
+  return (
+    norm.includes("\\documents\\codex\\") ||
+    norm.includes("\\codexdata\\documents-codex\\") ||
+    norm.includes("\\.zcode\\workspace\\") ||
+    norm.includes("\\.dsh\\default-workspace") ||
+    norm.includes("\\.gemini\\antigravity\\scratch") ||
+    norm.includes("\\codexbridgeservice\\")
+  );
+}
+
+/**
+ * 将任意会话归类到官方项目或方式 B 的 4 个客户端专属收件箱项目
+ */
+export function resolveSessionProjectPlacement({ provider, sessionId, rawCwd, projectId = null }) {
+  const catalog = loadCanonicalProjectCatalog();
+  const realCwd = ensureExistingDir(rawCwd);
+  const cleanedRaw = stripWinExtendedPrefix(String(rawCwd || "").trim());
+  const normRaw = cleanedRaw ? path.resolve(cleanedRaw).toLowerCase() : "";
+
+  // 1. Codex 明确标记为无项目的自由对话 (`projectless-thread-ids`)
+  if (
+    (provider === "codex" || provider === "codex-desktop") &&
+    sessionId &&
+    catalog.codexProjectlessSet.has(String(sessionId))
+  ) {
+    const inbox = getClientInboxProject(provider);
+    return {
+      projectName: inbox.projectName,
+      projectCwd: inbox.projectCwd,
+      realCwd,
+      isInbox: true,
+    };
+  }
+
+  // 2. 显式 Project ID 绑定（ZCode `project_id` 或 Codex `thread-project-assignments`）
+  const effectiveProjectId =
+    projectId ||
+    ((provider === "codex" || provider === "codex-desktop") && sessionId
+      ? catalog.codexThreadAssignments.get(String(sessionId))
+      : null);
+  if (effectiveProjectId && catalog.projectsById.has(String(effectiveProjectId))) {
+    const proj = catalog.projectsById.get(String(effectiveProjectId));
+    return {
+      projectName: proj.name,
+      projectCwd: proj.primaryCwd,
+      realCwd,
+      isInbox: false,
+    };
+  }
+
+  // 3. Git Worktree 路径自动归并（例如 `.codex\worktrees\ef38\90CN-Server` -> `90CN`，`arad40` -> `JP40`）
+  const wtMatch = /[\\/]worktrees[\\/][^\\/]+[\\/]([^\\/]+)/i.exec(cleanedRaw);
+  if (wtMatch) {
+    const repoBase = wtMatch[1].toLowerCase();
+    const matchedProj =
+      catalog.rootBasenameMap.get(repoBase) || catalog.projectsByNameLower.get(repoBase);
+    if (matchedProj) {
+      return {
+        projectName: matchedProj.name,
+        projectCwd: matchedProj.primaryCwd,
+        realCwd,
+        isInbox: false,
+      };
+    }
+  }
+
+  // 4. 若属于客户端默认临时目录（如 `Documents\Codex\...\new-chat`、`.zcode\workspace\default`），直接进入方式 B 收件箱
+  if (isAdhocScratchDirectory(cleanedRaw || realCwd)) {
+    const inbox = getClientInboxProject(provider);
+    return {
+      projectName: inbox.projectName,
+      projectCwd: inbox.projectCwd,
+      realCwd,
+      isInbox: true,
+    };
+  }
+
+  // 5. 最长路径前缀匹配官方项目根目录（例如 `E:\client\ARAD40E` 优先命中 `ARAD40E`，`D:\hirokun-DNF\cn90\90CN-PVF` 命中 `90CN`）
+  for (const candidatePath of [normRaw, path.resolve(realCwd).toLowerCase()]) {
+    if (!candidatePath) continue;
+    for (const { normRoot, project } of catalog.rootPrefixEntries) {
+      if (candidatePath === normRoot || candidatePath.startsWith(`${normRoot}${path.sep}`)) {
+        return {
+          projectName: project.name,
+          projectCwd: project.primaryCwd,
+          realCwd,
+          isInbox: false,
+        };
+      }
+    }
+  }
+
+  // 6. 目录同名归并（例如旧路径 `Documents\ChatGPT\DXF-V18-CN` 归并到官方项目 `DXF-V18-CN`）
+  if (normRaw) {
+    const baseLower = path.basename(normRaw).toLowerCase();
+    const matchedProj =
+      catalog.projectsByNameLower.get(baseLower) || catalog.rootBasenameMap.get(baseLower);
+    if (matchedProj) {
+      return {
+        projectName: matchedProj.name,
+        projectCwd: matchedProj.primaryCwd,
+        realCwd,
+        isInbox: false,
+      };
+    }
+  }
+
+  // 7. 其余未在客户端注册为项目的零散路径统一归入方式 B 的客户端自由对话收件箱
+  const inbox = getClientInboxProject(provider);
+  return {
+    projectName: inbox.projectName,
+    projectCwd: inbox.projectCwd,
+    realCwd,
+    isInbox: true,
+  };
+}
+
 export function cleanCodexPromptText(raw) {
   if (!raw || typeof raw !== "string") return "";
   let text = raw.trim();
 
-  const hasClipboardImg = /codex-clipboard-[^\s:]+\.png/i.test(text) || /Image attachment:\s*true/i.test(text);
+  const hasClipboardImg =
+    /codex-clipboard-[^\s:]+\.png/i.test(text) || /Image attachment:\s*true/i.test(text);
   const hasPastedFiles = /^#\s*Files (?:mentioned|pasted) by the user:/im.test(text);
 
   const reqMatch = /##\s*My request:\s*\r?\n([\s\S]*)$/i.exec(text);
@@ -105,7 +474,6 @@ export function cleanCodexPromptText(raw) {
   }
 
   if (hasClipboardImg || hasPastedFiles) {
-    // 没有 `## My request:` 时，剔除临时路径头保留真实正文
     const stripped = text
       .replace(/^#\s*Files (?:mentioned|pasted) by the user:[\s\S]*?(?:\r?\n\r?\n|$)/i, "")
       .replace(/^##\s*codex-clipboard-[^\r\n]+(?:\r?\nImage attachment:\s*true)?/gim, "")
@@ -131,7 +499,6 @@ export function cleanCodexTitle(raw) {
       .replace(/^Distinguish instructions in attached documents from the user's request\./gim, "")
       .trim();
   }
-  // 将 `[https://xxx](https://xxx)` 简化为可读链接文本
   text = text.replace(/\[(https?:\/\/[^\]]+)\]\(\1\)/g, "$1");
   return truncateTitle(text);
 }
@@ -222,20 +589,6 @@ function walkJsonlFiles(dir, out = []) {
 // ============================================================================
 // 1. OpenAI Codex (`~/.codex/state_*.sqlite` + `session_index.jsonl`)
 // ============================================================================
-function findLatestCodexStateDb() {
-  const codexRoot = path.join(homeDir, ".codex");
-  if (!fs.existsSync(codexRoot)) return null;
-  const candidates = fs
-    .readdirSync(codexRoot)
-    .filter((f) => /^state_\d+\.sqlite$/i.test(f))
-    .map((f) => {
-      const ver = Number.parseInt(f.match(/\d+/)?.[0] || "0", 10);
-      return { ver, fullPath: path.join(codexRoot, f) };
-    })
-    .sort((a, b) => b.ver - a.ver);
-  return candidates[0]?.fullPath || null;
-}
-
 function loadCodexSessionIndexTitles() {
   const map = new Map();
   const idxPath = path.join(homeDir, ".codex", "session_index.jsonl");
@@ -269,9 +622,11 @@ export function listCodexSessions({ limit = Infinity, includeArchived = false } 
       db = new DatabaseSync(stateDbPath, { open: true, readOnly: true });
       const sql = `
         SELECT id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
-               cwd, title, first_user_message, name, model, archived, agent_role
+               cwd, title, first_user_message, name, model, archived, agent_role, source
         FROM threads
         WHERE (agent_role IS NULL OR agent_role = '')
+          AND (source IS NULL OR (source NOT LIKE '%subagent%' AND source != 'exec'))
+          AND (cwd IS NULL OR cwd NOT LIKE '%CodexBridgeService%')
           ${includeArchived ? "" : "AND archived = 0"}
         ORDER BY COALESCE(updated_at_ms, updated_at * 1000) DESC
       `;
@@ -296,7 +651,11 @@ export function listCodexSessions({ limit = Infinity, includeArchived = false } 
           ? truncateTitle(indexedTitle)
           : cleanCodexTitle(row.title || row.first_user_message || id) || id;
 
-        const cwd = ensureExistingDir(row.cwd);
+        const placement = resolveSessionProjectPlacement({
+          provider: "codex",
+          sessionId: id,
+          rawCwd: row.cwd ? String(row.cwd) : "",
+        });
         const createdAt = normalizeIsoTimestamp(row.created_at_ms ?? row.created_at);
         const updatedAt = normalizeIsoTimestamp(row.updated_at_ms ?? row.updated_at);
         const rolloutPath = stripWinExtendedPrefix(String(row.rollout_path || ""));
@@ -304,7 +663,10 @@ export function listCodexSessions({ limit = Infinity, includeArchived = false } 
         results.push({
           provider: "codex",
           sessionId: id,
-          cwd,
+          cwd: placement.projectCwd,
+          realCwd: placement.realCwd,
+          projectName: placement.projectName,
+          isInbox: placement.isInbox,
           title: finalTitle,
           createdAt,
           updatedAt,
@@ -324,64 +686,7 @@ export function listCodexSessions({ limit = Infinity, includeArchived = false } 
     }
   }
 
-  // 回退方案：扫描 `~/.codex/sessions`，排除带 `_subagentId` 的子代理文件
-  const sessionsRoot = path.join(homeDir, ".codex", "sessions");
-  const files = walkJsonlFiles(sessionsRoot)
-    .filter((f) => !/_[0-9a-f-]{20,}\.jsonl$/i.test(f.name))
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const results = [];
-  const seenIds = new Set();
-
-  for (const file of files) {
-    if (results.length >= limit) break;
-    try {
-      const lines = readTailLines(file.path, 512 * 1024);
-      let sessionId = null;
-      let cwd = homeDir;
-      let firstUserPrompt = "";
-
-      const headLines = fs.readFileSync(file.path, "utf8").slice(0, 65536).split(/\r?\n/);
-      for (const line of [...headLines, ...lines.slice(0, 30)]) {
-        if (!line.trim()) continue;
-        try {
-          const obj = JSON.parse(line);
-          if (obj.type === "session_meta" && obj.payload) {
-            sessionId = obj.payload.id || obj.payload.session_id || sessionId;
-            if (obj.payload.cwd) cwd = ensureExistingDir(obj.payload.cwd);
-          } else if (
-            !firstUserPrompt &&
-            obj.type === "event_msg" &&
-            obj.payload?.type === "user_message" &&
-            typeof obj.payload?.message === "string" &&
-            !isSyntheticPromptNoise(obj.payload.message)
-          ) {
-            firstUserPrompt = obj.payload.message;
-          }
-          if (sessionId && firstUserPrompt) break;
-        } catch {
-          // ignore
-        }
-      }
-
-      if (!sessionId || seenIds.has(sessionId) || !firstUserPrompt) continue;
-      seenIds.add(sessionId);
-      const indexedTitle = titleIndex.get(sessionId);
-      results.push({
-        provider: "codex",
-        sessionId,
-        cwd,
-        title: indexedTitle ? truncateTitle(indexedTitle) : cleanCodexTitle(firstUserPrompt),
-        createdAt: new Date(file.birthtimeMs || file.mtimeMs).toISOString(),
-        updatedAt: new Date(file.mtimeMs).toISOString(),
-        model: null,
-        filePath: file.path,
-      });
-    } catch {
-      // ignore
-    }
-  }
-
-  return results;
+  return [];
 }
 
 function findCodexRolloutPath(sessionId) {
@@ -613,7 +918,6 @@ export async function discoverAntigravityLanguageServer({ forceRefresh = false }
 
     for (const proc of candidates) {
       const cmd = String(proc?.cmd || "");
-      // 优先连接桌面版主实例 (`--app_data_dir antigravity`)
       const csrfMatch = /--csrf_token[=\s]+([^\s"]+)/.exec(cmd);
       if (!csrfMatch) continue;
       const csrf = csrfMatch[1];
@@ -626,7 +930,7 @@ export async function discoverAntigravityLanguageServer({ forceRefresh = false }
           cachedAntigravityLsAt = Date.now();
           return cachedAntigravityLs;
         } catch {
-          // 尝试下一个监听端口（例如跳过 HTTPS 端口命中 HTTP 端口）
+          // 尝试下一个监听端口
         }
       }
     }
@@ -665,22 +969,22 @@ function findAntigravityTranscriptPath(sessionId) {
     path.join(
       homeDir,
       ".gemini",
-      "antigravity-cli",
-      "brain",
-      sessionId,
-      ".system_generated",
-      "logs",
-      "transcript_full.jsonl",
-    ),
-    path.join(
-      homeDir,
-      ".gemini",
       "antigravity",
       "brain",
       sessionId,
       ".system_generated",
       "logs",
       "transcript.jsonl",
+    ),
+    path.join(
+      homeDir,
+      ".gemini",
+      "antigravity-cli",
+      "brain",
+      sessionId,
+      ".system_generated",
+      "logs",
+      "transcript_full.jsonl",
     ),
     path.join(
       homeDir,
@@ -724,10 +1028,9 @@ export function isAntigravityDesktopSession(sessionId) {
 export function listAntigravitySessions({ limit = Infinity } = {}) {
   const byId = new Map();
 
-  // 1. 优先从桌面端与 CLI 的官方 SQLite 摘要库读取根会话（天然剔除所有 Subagent 子代理）
-  for (const sub of ["antigravity", "antigravity-cli"]) {
-    const dbPath = path.join(homeDir, ".gemini", sub, "conversation_summaries.db");
-    if (!fs.existsSync(dbPath)) continue;
+  // 仅从桌面端 `antigravity/conversation_summaries.db` 读取用户真实会话（剔除 `antigravity-cli`、子代理与空会话）
+  const dbPath = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
+  if (fs.existsSync(dbPath)) {
     let db;
     try {
       db = new DatabaseSync(dbPath, { open: true, readOnly: true });
@@ -735,7 +1038,7 @@ export function listAntigravitySessions({ limit = Infinity } = {}) {
         .prepare(
           `SELECT conversation_id, title, preview, step_count, last_modified_time,
                   last_user_input_time, workspace_uris, parent_conversation_id,
-                  nesting_depth, killed, app_data_dir
+                  nesting_depth, killed
            FROM conversation_summaries
            WHERE (parent_conversation_id IS NULL OR parent_conversation_id = '')
              AND (nesting_depth IS NULL OR nesting_depth = 0)
@@ -747,18 +1050,30 @@ export function listAntigravitySessions({ limit = Infinity } = {}) {
       for (const r of rows) {
         const id = String(r.conversation_id || "").trim();
         if (!id) continue;
+
+        // Antigravity 桌面端 UI 发起的真实用户会话均具备非空 title；
+        // 无 title 的记录为 2 步中断草稿或 CodexBridge 后台无头探测任务
+        const uiTitle = String(r.title || "").trim();
+        if (!uiTitle) continue;
+
+        const rawWs = r.workspace_uris ? String(r.workspace_uris) : "";
+        if (rawWs.includes("CodexBridgeService")) continue;
+
         const updatedAt = normalizeIsoTimestamp(r.last_modified_time || r.last_user_input_time);
-        const existing = byId.get(id);
-        if (existing && Date.parse(existing.updatedAt) >= Date.parse(updatedAt)) {
-          continue;
-        }
-        const rawTitle = String(r.title || r.preview || id).trim();
-        const cwd = ensureExistingDir(r.workspace_uris ? String(r.workspace_uris) : "");
+        const placement = resolveSessionProjectPlacement({
+          provider: "antigravity",
+          sessionId: id,
+          rawCwd: rawWs,
+        });
+
         byId.set(id, {
           provider: "antigravity",
           sessionId: id,
-          cwd,
-          title: truncateTitle(cleanAntigravityUserText(rawTitle) || rawTitle),
+          cwd: placement.projectCwd,
+          realCwd: placement.realCwd,
+          projectName: placement.projectName,
+          isInbox: placement.isInbox,
+          title: truncateTitle(cleanAntigravityUserText(uiTitle) || uiTitle),
           createdAt: updatedAt,
           updatedAt,
         });
@@ -768,47 +1083,6 @@ export function listAntigravitySessions({ limit = Infinity } = {}) {
     } finally {
       try {
         db?.close();
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  // 2. 补充扫描 brain 目录，严格要求存在 `source === "USER_EXPLICIT"` 才放行（杜绝子代理混入）
-  for (const sub of ["antigravity", "antigravity-cli"]) {
-    const root = path.join(homeDir, ".gemini", sub, "brain");
-    if (!fs.existsSync(root)) continue;
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name === "tempmediaStorage" || byId.has(entry.name)) {
-        continue;
-      }
-      const transcriptPath = findAntigravityTranscriptPath(entry.name);
-      if (!transcriptPath) continue;
-      try {
-        const stat = fs.statSync(transcriptPath);
-        const head = fs.readFileSync(transcriptPath, "utf8").slice(0, 128 * 1024).split(/\r?\n/);
-        let firstExplicitText = "";
-        for (const line of head) {
-          if (!line.trim()) continue;
-          try {
-            const step = JSON.parse(line);
-            if (step.type === "USER_INPUT" && step.source === "USER_EXPLICIT") {
-              firstExplicitText = cleanAntigravityUserText(step.content);
-              if (firstExplicitText) break;
-            }
-          } catch {
-            // ignore
-          }
-        }
-        if (!firstExplicitText) continue;
-        byId.set(entry.name, {
-          provider: "antigravity",
-          sessionId: entry.name,
-          cwd: homeDir,
-          title: truncateTitle(firstExplicitText),
-          createdAt: new Date(stat.birthtimeMs || stat.mtimeMs).toISOString(),
-          updatedAt: new Date(stat.mtimeMs).toISOString(),
-        });
       } catch {
         // ignore
       }
@@ -855,7 +1129,6 @@ export function loadAntigravityHistory(sessionId, maxMessages = 200) {
       }
 
       if (step.type === "USER_INPUT") {
-        // 严格只保留真实用户输入，剔除系统恢复提示与子代理消息
         if (step.source && step.source !== "USER_EXPLICIT") continue;
         const cleaned = cleanAntigravityUserText(step.content);
         if (!cleaned) continue;
@@ -923,13 +1196,12 @@ export function listZCodeSessions({ limit = Infinity, includeArchived = false } 
   let tasksDb;
   try {
     cliDb = new DatabaseSync(cliDbPath, { open: true, readOnly: true });
-    const validSessionIds = new Set(
+    const sessionsWithMessages = new Set(
       cliDb
         .prepare(
           `SELECT s.id
            FROM session s
-           WHERE s.parent_id IS NULL
-             AND s.time_deleted IS NULL
+           WHERE s.time_deleted IS NULL
              AND EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id)`,
         )
         .all()
@@ -940,7 +1212,7 @@ export function listZCodeSessions({ limit = Infinity, includeArchived = false } 
       tasksDb = new DatabaseSync(tasksDbPath, { open: true, readOnly: true });
       const taskRows = tasksDb
         .prepare(
-          `SELECT task_id, title, cli_title, workspace_path, root_path, created_at, updated_at
+          `SELECT task_id, title, cli_title, workspace_path, root_path, project_id, created_at, updated_at
            FROM tasks
            WHERE deleted = 0
              AND (cli_deleted IS NULL OR cli_deleted = 0)
@@ -953,13 +1225,23 @@ export function listZCodeSessions({ limit = Infinity, includeArchived = false } 
       for (const row of taskRows) {
         if (results.length >= limit) break;
         const id = String(row.task_id || "");
-        if (!id || !validSessionIds.has(id)) continue;
-        const rawTitle = String(row.title || row.cli_title || id).trim();
-        const cwd = ensureExistingDir(String(row.workspace_path || row.root_path || homeDir));
+        if (!id || !sessionsWithMessages.has(id)) continue;
+        const rawTitle = String(row.title || row.cli_title || "").trim();
+        if (!rawTitle) continue;
+        const rawPath = String(row.workspace_path || row.root_path || homeDir);
+        const placement = resolveSessionProjectPlacement({
+          provider: "zcode",
+          sessionId: id,
+          rawCwd: rawPath,
+          projectId: row.project_id ? String(row.project_id) : null,
+        });
         results.push({
           provider: "zcode",
           sessionId: id,
-          cwd,
+          cwd: placement.projectCwd,
+          realCwd: placement.realCwd,
+          projectName: placement.projectName,
+          isInbox: placement.isInbox,
           title: truncateTitle(rawTitle),
           createdAt: normalizeIsoTimestamp(row.created_at || row.updated_at),
           updatedAt: normalizeIsoTimestamp(row.updated_at),
@@ -968,7 +1250,6 @@ export function listZCodeSessions({ limit = Infinity, includeArchived = false } 
       return results;
     }
 
-    // 无桌面端 v2 库时回退到纯 CLI 库
     const rows = cliDb
       .prepare(
         `SELECT s.id, s.directory, s.title, s.time_created, s.time_updated
@@ -980,14 +1261,25 @@ export function listZCodeSessions({ limit = Infinity, includeArchived = false } 
       )
       .all();
 
-    return rows.slice(0, limit).map((row) => ({
-      provider: "zcode",
-      sessionId: String(row.id),
-      cwd: ensureExistingDir(String(row.directory || homeDir)),
-      title: truncateTitle(row.title || row.id),
-      createdAt: normalizeIsoTimestamp(row.time_created || row.time_updated),
-      updatedAt: normalizeIsoTimestamp(row.time_updated),
-    }));
+    return rows.slice(0, limit).map((row) => {
+      const id = String(row.id);
+      const placement = resolveSessionProjectPlacement({
+        provider: "zcode",
+        sessionId: id,
+        rawCwd: String(row.directory || homeDir),
+      });
+      return {
+        provider: "zcode",
+        sessionId: id,
+        cwd: placement.projectCwd,
+        realCwd: placement.realCwd,
+        projectName: placement.projectName,
+        isInbox: placement.isInbox,
+        title: truncateTitle(row.title || id),
+        createdAt: normalizeIsoTimestamp(row.time_created || row.time_updated),
+        updatedAt: normalizeIsoTimestamp(row.time_updated),
+      };
+    });
   } catch {
     return [];
   } finally {
@@ -1051,7 +1343,6 @@ export function loadZCodeHistory(sessionId, maxMessages = 200) {
       const role = parsedMsg.role;
       if (role !== "user" && role !== "assistant") continue;
 
-      // 过滤系统自动注入的隐藏提醒消息 (`system_reminder` / `todo_reminder`)
       const sem = parsedMsg.semantics;
       if (role === "user") {
         if (sem?.uiVisibility === "hidden" || sem?.origin === "agent_runtime") {
@@ -1248,7 +1539,7 @@ export function syncZCodeDesktopTaskIndex({ sessionId, cwd, title, mode = "yolo"
       );
     }
   } catch {
-    // 若 ZCode 桌面端正短暂锁表则安全跳过，不影响主会话返回
+    // 若 ZCode 桌面端正短暂锁表则安全跳过
   } finally {
     try {
       db?.close();
@@ -1259,8 +1550,103 @@ export function syncZCodeDesktopTaskIndex({ sessionId, cwd, title, mode = "yolo"
 }
 
 // ============================================================================
-// 4. DeepSeek Harness (`workspace.json` + `session_projcache` + `session.v4.jsonl.zstd`)
+// 4. DeepSeek Harness (`workspace.json` + `session_projcache` + Cordis 原生直连)
 // ============================================================================
+export function discoverDshDesktopConnector() {
+  const descriptorPath = path.join(paseoHome, "dsh-desktop-connector.json");
+  if (!fs.existsSync(descriptorPath)) return null;
+  try {
+    const desc = JSON.parse(fs.readFileSync(descriptorPath, "utf8"));
+    if (!desc?.port || !desc?.token) return null;
+    return {
+      host: desc.host || "127.0.0.1",
+      port: Number(desc.port),
+      token: String(desc.token),
+      pid: desc.pid,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function callDshDesktopConnector(
+  method,
+  params = {},
+  { onStream = null, timeoutMs = 600_000 } = {},
+) {
+  const conn = discoverDshDesktopConnector();
+  if (!conn) {
+    return Promise.reject(new Error("DSH Desktop connector descriptor not found"));
+  }
+
+  return new Promise((resolve, reject) => {
+    const reqId = randomUUID();
+    const socket = net.createConnection({ host: conn.host, port: conn.port });
+    socket.setEncoding("utf8");
+    let buffer = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        socket.destroy();
+        reject(new Error(`DSH Desktop connector timeout (${method})`));
+      }
+    }, timeoutMs);
+    timer.unref?.();
+
+    socket.on("connect", () => {
+      socket.write(
+        `${JSON.stringify({ id: reqId, token: conn.token, method, params })}\n`,
+      );
+    });
+
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let idx = buffer.indexOf("\n");
+      while (idx !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        idx = buffer.indexOf("\n");
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.type === "stream" && typeof onStream === "function") {
+            onStream(msg);
+          } else if (msg.id === reqId) {
+            settled = true;
+            clearTimeout(timer);
+            socket.end();
+            if (msg.ok) {
+              resolve(msg.result);
+            } else {
+              reject(new Error(msg.error || "DSH Desktop connector error"));
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    socket.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+
+    socket.on("close", () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error("DSH Desktop connector socket closed before response"));
+      }
+    });
+  });
+}
+
 function loadDshArchivedSet() {
   const archived = new Set();
   const wsJson = path.join(homeDir, ".dsh", "storages", "workspace.json");
@@ -1341,7 +1727,6 @@ function parseDshZstdFile(zstdFile) {
       } else if (evt.type === "subagent/descriptor") {
         isSubagent = true;
       } else if (evt.type === "user/message" && Array.isArray(evt.data?.content)) {
-        // 严格只保留真实用户发送的消息 (`source.kind === "user"`)
         const sourceKind = evt.data?.source?.kind;
         if (sourceKind && sourceKind !== "user") continue;
 
@@ -1352,7 +1737,6 @@ function parseDshZstdFile(zstdFile) {
           .trim();
         if (!text || isSyntheticPromptNoise(text)) continue;
 
-        // 若无显式 `source` 字段但属于系统注入，已被 `isSyntheticPromptNoise` 拦截
         if (!sourceKind && (text.startsWith("Current runtime context") || text.startsWith("Time sampled"))) {
           continue;
         }
@@ -1445,12 +1829,19 @@ export function listDshSessions({ limit = Infinity, includeArchived = false } = 
         const turns = rows.turnOutline?.val?.turns || [];
         if (isSubagent || isBlank || turns.length === 0) continue;
 
+        const rawCwd = String(rows.workingDirectory?.val || identity.cwd || "");
+        if (rawCwd.includes("CodexBridgeService")) continue;
+
         const titleVal =
           rows.title?.val ||
           rows.titleInput?.val?.first?.text ||
           turns[0]?.prompt ||
           rawId;
-        const cwd = ensureExistingDir(rows.workingDirectory?.val || identity.cwd);
+        const placement = resolveSessionProjectPlacement({
+          provider: "dsh",
+          sessionId: rawId,
+          rawCwd,
+        });
         const updatedMs =
           rows.timeContext?.val?.lastMessageTime ||
           rows.sessionListMetadata?.val?.lastPromptAt ||
@@ -1460,7 +1851,10 @@ export function listDshSessions({ limit = Infinity, includeArchived = false } = 
         byId.set(rawId, {
           provider: "dsh",
           sessionId: rawId,
-          cwd,
+          cwd: placement.projectCwd,
+          realCwd: placement.realCwd,
+          projectName: placement.projectName,
+          isInbox: placement.isInbox,
           title: truncateTitle(titleVal),
           createdAt: normalizeIsoTimestamp(createdMs),
           updatedAt: normalizeIsoTimestamp(updatedMs),
@@ -1471,20 +1865,30 @@ export function listDshSessions({ limit = Infinity, includeArchived = false } = 
     }
   }
 
-  // 2. 补充扫描 `.jsonl.zstd`（兼容纯 CLI 新建且尚未写入桌面缓存的会话）
+  // 2. 补充扫描 `.jsonl.zstd`
   for (const item of findAllDshSessionFiles()) {
     if (byId.has(item.sessionId)) continue;
     if (!includeArchived && archivedSet.has(item.sessionId)) continue;
     const parsed = parseDshZstdFile(item.zstdFile);
     if (!parsed || parsed.isSubagent || parsed.messages.length === 0) continue;
+    if (String(parsed.cwd || "").includes("CodexBridgeService")) continue;
     const sid = parsed.sessionId || item.sessionId;
     if (!includeArchived && archivedSet.has(sid)) continue;
     if (byId.has(sid)) continue;
 
+    const placement = resolveSessionProjectPlacement({
+      provider: "dsh",
+      sessionId: sid,
+      rawCwd: parsed.cwd,
+    });
+
     byId.set(sid, {
       provider: "dsh",
       sessionId: sid,
-      cwd: parsed.cwd,
+      cwd: placement.projectCwd,
+      realCwd: placement.realCwd,
+      projectName: placement.projectName,
+      isInbox: placement.isInbox,
       title: parsed.title,
       createdAt: new Date(item.birthtimeMs || item.mtimeMs).toISOString(),
       updatedAt: new Date(item.mtimeMs).toISOString(),
@@ -1513,7 +1917,6 @@ export function loadDshHistory(sessionId, maxMessages = 200) {
     }
   }
 
-  // 回退读取投影缓存大纲
   const cacheFile = path.join(
     homeDir,
     ".dsh",
@@ -1546,4 +1949,38 @@ export function loadDshHistory(sessionId, maxMessages = 200) {
   }
 
   return { title: null, updatedAt: null, messages: [] };
+}
+
+/**
+ * 解析指定会话的真实物理工作目录（当会话被归入方式 B 的 `XXX 自由对话` 收件箱时，还原其原始执行目录）
+ */
+export function resolveRealCwdForSession(provider, sessionId, fallbackCwd = homeDir) {
+  const normFallback = ensureExistingDir(fallbackCwd);
+  const isInboxDir = normFallback
+    .toLowerCase()
+    .startsWith(path.join(paseoHome, "inboxes").toLowerCase());
+  if (!sessionId) {
+    return isInboxDir ? homeDir : normFallback;
+  }
+
+  try {
+    let list = [];
+    if (provider === "codex" || provider === "codex-desktop") {
+      list = listCodexSessions({ includeArchived: true });
+    } else if (provider === "antigravity") {
+      list = listAntigravitySessions();
+    } else if (provider === "zcode") {
+      list = listZCodeSessions({ includeArchived: true });
+    } else if (provider === "dsh") {
+      list = listDshSessions({ includeArchived: true });
+    }
+    const found = list.find((s) => s.sessionId === sessionId);
+    if (found?.realCwd) {
+      return ensureExistingDir(found.realCwd);
+    }
+  } catch {
+    // ignore
+  }
+
+  return isInboxDir ? homeDir : normFallback;
 }
