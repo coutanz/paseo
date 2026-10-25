@@ -263,13 +263,22 @@ async function syncPaseoDaemonConfig(dryRun) {
     },
   };
 
+  // 1b. Codex Desktop Mirror (read-only lock-free mirror for threads actively open in Codex Desktop)
+  current.agents.providers["codex-desktop"] = {
+    enabled: true,
+    extends: "acp",
+    label: "Codex (Desktop Mirror)",
+    description: "Lock-free mirror for active Codex Desktop conversations",
+    command: [nodeExe, "--no-warnings", acpBridgePath, "codex-desktop"],
+  };
+
   // 2. Antigravity (`agy`) via Universal ACP Stdio Bridge (compatible with Paseo 0.10.x & 0.13.x)
   current.agents.providers.antigravity = {
     enabled: true,
     extends: "acp",
     label: "Antigravity (Google)",
     description: "Google Antigravity CLI with Windows Computer Use & Browser Use MCP",
-    command: [nodeExe, acpBridgePath, "antigravity"],
+    command: [nodeExe, "--no-warnings", acpBridgePath, "antigravity"],
   };
 
   // 3. GLM ZCode (`zcode`) via Universal ACP Stdio Bridge
@@ -278,7 +287,7 @@ async function syncPaseoDaemonConfig(dryRun) {
     extends: "acp",
     label: "ZCode (GLM)",
     description: "Z.AI GLM-5.3 ZCode CLI with Windows Computer Use & Browser Use MCP",
-    command: [nodeExe, acpBridgePath, "zcode"],
+    command: [nodeExe, "--no-warnings", acpBridgePath, "zcode"],
   };
 
   // 4. DeepSeek Harness (`dsh`) via Universal ACP Stdio Bridge
@@ -287,7 +296,7 @@ async function syncPaseoDaemonConfig(dryRun) {
     extends: "acp",
     label: "DeepSeek DSH",
     description: "DeepSeek V4.1 Harness CLI with Windows Computer Use & Browser Use MCP",
-    command: [nodeExe, acpBridgePath, "dsh"],
+    command: [nodeExe, "--no-warnings", acpBridgePath, "dsh"],
   };
 
   await writeJsonFile(filePath, current, dryRun);

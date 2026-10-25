@@ -4,20 +4,34 @@
  * Paseo Omni — Universal ACP (Agent Client Protocol) Stdio Bridge
  *
  * Bridges:
- *   - Google Antigravity CLI (`agy`)
- *   - GLM ZCode CLI (`zcode.cjs` / `zcode`)
- *   - DeepSeek Harness CLI (`dsh.cmd` / `dsh`)
- * into standard ACP JSON-RPC 2.0 over NDJSON stdio so any Paseo version
- * (including Paseo Desktop 0.10.x and 0.13.x+) can control all 4 agents
- * from Mobile (`app.paseo.sh` / iOS / Android), Web UI, or CLI.
+ *   - OpenAI Codex Live Mirror (`codex-desktop` for threads locked by Codex Desktop App)
+ *   - Google Antigravity CLI (`agy`) + Antigravity Desktop IDE transcripts
+ *   - GLM ZCode CLI (`zcode.cjs` / `zcode`) + `~/.zcode/cli/db/db.sqlite` history
+ *   - DeepSeek Harness CLI (`dsh.cmd` / `dsh`) + `~/.dsh/sessions` zstd history
+ * into standard ACP JSON-RPC 2.0 over NDJSON stdio, including:
+ *   - `session/list` (discover existing local sessions)
+ *   - `session/load` (replay full historical conversation into Paseo Mobile/Web/Desktop)
+ *   - `session/prompt` (continue existing sessions or start new turns)
  */
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import fs, { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import {
+  getZCodeSessionTitle,
+  isAntigravityCliNativeSession,
+  listAntigravitySessions,
+  listCodexSessions,
+  listDshSessions,
+  listZCodeSessions,
+  loadAntigravityHistory,
+  loadCodexHistory,
+  loadDshHistory,
+  loadZCodeHistory,
+} from "./omni-session-store.mjs";
 
 const isWin = process.platform === "win32";
 const homeDir = os.homedir();
@@ -25,6 +39,22 @@ const localAppData = process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "
 const targetProvider = (process.argv[2] || "zcode").toLowerCase();
 
 const PROVIDER_CATALOGS = {
+  "codex-desktop": {
+    name: "Codex (Desktop Mirror)",
+    defaultModel: "gpt-5.4",
+    models: [
+      { modelId: "gpt-5.4", name: "GPT-5.4 / Configured Default" },
+      { modelId: "gpt-5.3-codex", name: "GPT-5.3 Codex" },
+    ],
+    defaultMode: "full-access",
+    modes: [
+      {
+        id: "full-access",
+        name: "Full Access (Bypass Sandbox)",
+        description: "Runs codex exec with full desktop & Computer Use access",
+      },
+    ],
+  },
   antigravity: {
     name: "Antigravity (Google)",
     defaultModel: "claude-opus-4-6-thinking",
@@ -157,6 +187,21 @@ function extractPromptText(promptBlocks) {
 
 function resolveExecutable(provider) {
   const nodeExe = process.execPath;
+  if (provider === "codex-desktop") {
+    if (isWin) {
+      const codexBinRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+      if (existsSync(codexBinRoot)) {
+        for (const sub of fs.readdirSync(codexBinRoot)) {
+          const candidate = path.join(codexBinRoot, sub, "codex.exe");
+          if (existsSync(candidate)) {
+            return { command: candidate, baseArgs: [], shell: false };
+          }
+        }
+      }
+    }
+    return { command: "codex", baseArgs: [], shell: isWin };
+  }
+
   if (provider === "zcode") {
     const zcodeCjs = path.join(localAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
     if (isWin && existsSync(zcodeCjs)) {
@@ -203,6 +248,190 @@ function killProcessTree(child) {
   }
 }
 
+function listLocalProviderSessions() {
+  if (targetProvider === "codex-desktop") {
+    return listCodexSessions({ limit: 50 });
+  }
+  if (targetProvider === "antigravity") {
+    return listAntigravitySessions({ limit: 50 });
+  }
+  if (targetProvider === "dsh") {
+    return listDshSessions({ limit: 50 });
+  }
+  return listZCodeSessions({ limit: 50 });
+}
+
+function replaySessionHistory(session) {
+  let messages = [];
+  let title = null;
+  let updatedAt = null;
+
+  if (targetProvider === "codex-desktop") {
+    const loaded = loadCodexHistory(session.id, 80);
+    messages = loaded.messages;
+    title = loaded.title;
+    updatedAt = loaded.updatedAt;
+    if (messages.length > 0) {
+      session.handoffContext = messages
+        .slice(-6)
+        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1200)}`)
+        .join("\n\n");
+    }
+  } else if (targetProvider === "antigravity") {
+    messages = loadAntigravityHistory(session.id, 80);
+    const meta = listAntigravitySessions({ limit: 60 }).find((s) => s.sessionId === session.id);
+    if (meta) {
+      title = meta.title;
+      updatedAt = meta.updatedAt;
+    }
+    if (!isAntigravityCliNativeSession(session.id) && messages.length > 0) {
+      session.backendSessionId = null;
+      session.handoffContext = messages
+        .slice(-6)
+        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1200)}`)
+        .join("\n\n");
+    }
+  } else if (targetProvider === "dsh") {
+    const loaded = loadDshHistory(session.id, 80);
+    messages = loaded.messages;
+    title = loaded.title;
+    updatedAt = loaded.updatedAt;
+  } else {
+    messages = loadZCodeHistory(session.id, 80);
+    const info = getZCodeSessionTitle(session.id);
+    if (info) {
+      title = info.title;
+      updatedAt = info.updatedAt;
+    }
+  }
+
+  if (title) {
+    sendSessionUpdate(session.id, {
+      sessionUpdate: "session_info_update",
+      title,
+      ...(updatedAt ? { updatedAt } : {}),
+    });
+  }
+
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i];
+    const msgId = msg.id || `hist-${i}`;
+    if (msg.role === "user") {
+      sendSessionUpdate(session.id, {
+        sessionUpdate: "user_message_chunk",
+        messageId: msgId,
+        content: { type: "text", text: msg.text },
+      });
+    } else {
+      if (msg.thinking) {
+        sendSessionUpdate(session.id, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: msg.thinking },
+        });
+      }
+      sendSessionUpdate(session.id, {
+        sessionUpdate: "agent_message_chunk",
+        messageId: msgId,
+        content: { type: "text", text: msg.text },
+      });
+    }
+  }
+}
+
+async function runCodexMirrorTurn(session, promptText) {
+  const { command, baseArgs, shell } = resolveExecutable("codex-desktop");
+  let effectivePrompt = promptText;
+  const args = [...baseArgs, "exec"];
+
+  if (session.forkedThreadId) {
+    args.push(
+      "resume",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--skip-git-repo-check",
+      "--json",
+      session.forkedThreadId,
+      effectivePrompt,
+    );
+  } else {
+    if (session.handoffContext) {
+      effectivePrompt = `[以下是此前在 Codex 桌面端会话中的上下文，请无缝衔继续执行]\n${session.handoffContext}\n\n[用户最新指令]\n${promptText}`;
+      session.handoffContext = null;
+    }
+    args.push(
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--skip-git-repo-check",
+      "--json",
+      effectivePrompt,
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: session.cwd,
+      env: process.env,
+      shell,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    session.activeChild = child;
+
+    let emittedAny = false;
+    let stderr = "";
+    const rl = readline.createInterface({ input: child.stdout });
+
+    rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      try {
+        const evt = JSON.parse(trimmed);
+        if (evt.thread_id) {
+          session.forkedThreadId = evt.thread_id;
+        }
+        if (evt.type === "item.completed" && evt.item?.type === "agent_message" && evt.item.text) {
+          emittedAny = true;
+          sendSessionUpdate(session.id, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: evt.item.text },
+          });
+        } else if (evt.type === "item.completed" && evt.item?.type === "reasoning" && evt.item.text) {
+          sendSessionUpdate(session.id, {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: evt.item.text },
+          });
+        }
+      } catch {
+        // ignore non-json lines
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-8192);
+    });
+
+    child.on("error", (err) => {
+      session.activeChild = null;
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      session.activeChild = null;
+      if (session.canceled) {
+        resolve({ stopReason: "cancelled" });
+        return;
+      }
+      if (code !== 0 && !emittedAny) {
+        sendSessionUpdate(session.id, {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: stderr.trim() || `Codex exited with code ${code}`,
+          },
+        });
+      }
+      resolve({ stopReason: "end_turn" });
+    });
+  });
+}
+
 async function runAntigravityTurn(session, promptText) {
   const { command, baseArgs, shell } = resolveExecutable("antigravity");
   const args = [
@@ -223,6 +452,12 @@ async function runAntigravityTurn(session, promptText) {
     args.push("--resume", session.backendSessionId);
   }
 
+  let effectivePrompt = promptText;
+  if (!session.backendSessionId && session.handoffContext) {
+    effectivePrompt = `[以下是此前在 Antigravity 桌面端会话中的最近上下文，请无缝衔继续回答]\n${session.handoffContext}\n\n[用户最新指令]\n${promptText}`;
+    session.handoffContext = null;
+  }
+
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: session.cwd,
@@ -236,7 +471,7 @@ async function runAntigravityTurn(session, promptText) {
       type: "user",
       message: {
         role: "user",
-        content: [{ type: "text", text: promptText }],
+        content: [{ type: "text", text: effectivePrompt }],
       },
     });
     child.stdin.write(`${userPayload}\n`);
@@ -483,6 +718,10 @@ async function handleRequest(msg) {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: true,
+          sessionCapabilities: {
+            list: {},
+            close: {},
+          },
           promptCapabilities: {
             image: true,
             embeddedContext: true,
@@ -490,7 +729,7 @@ async function handleRequest(msg) {
         },
         agentInfo: {
           name: catalog.name,
-          version: "1.0.0",
+          version: "1.2.0",
         },
       });
       return;
@@ -498,6 +737,25 @@ async function handleRequest(msg) {
     case "authenticate":
       sendResult(id, {});
       return;
+
+    case "session/list": {
+      const all = listLocalProviderSessions();
+      const filtered = params?.cwd
+        ? all.filter(
+            (s) => path.resolve(s.cwd).toLowerCase() === path.resolve(params.cwd).toLowerCase(),
+          )
+        : all;
+      sendResult(id, {
+        sessions: filtered.map((s) => ({
+          sessionId: s.sessionId,
+          cwd: s.cwd,
+          title: s.title,
+          updatedAt: s.updatedAt,
+        })),
+        nextCursor: null,
+      });
+      return;
+    }
 
     case "session/new": {
       const sessionId = randomUUID();
@@ -507,6 +765,8 @@ async function handleRequest(msg) {
         modelId: catalog.defaultModel,
         modeId: catalog.defaultMode,
         backendSessionId: null,
+        forkedThreadId: null,
+        handoffContext: null,
         activeChild: null,
         canceled: false,
       };
@@ -529,10 +789,15 @@ async function handleRequest(msg) {
           modelId: catalog.defaultModel,
           modeId: catalog.defaultMode,
           backendSessionId: sessionId,
+          forkedThreadId: null,
+          handoffContext: null,
           activeChild: null,
           canceled: false,
         };
         sessions.set(sessionId, session);
+      }
+      if (method === "session/load") {
+        replaySessionHistory(session);
       }
       sendResult(id, {
         sessionId,
@@ -585,7 +850,9 @@ async function handleRequest(msg) {
           cwd: process.cwd(),
           modelId: catalog.defaultModel,
           modeId: catalog.defaultMode,
-          backendSessionId: null,
+          backendSessionId: sessionId || null,
+          forkedThreadId: null,
+          handoffContext: null,
           activeChild: null,
           canceled: false,
         };
@@ -595,7 +862,9 @@ async function handleRequest(msg) {
       const promptText = extractPromptText(params?.prompt);
 
       let result;
-      if (targetProvider === "antigravity") {
+      if (targetProvider === "codex-desktop") {
+        result = await runCodexMirrorTurn(session, promptText);
+      } else if (targetProvider === "antigravity") {
         result = await runAntigravityTurn(session, promptText);
       } else if (targetProvider === "dsh") {
         result = await runDshTurn(session, promptText);

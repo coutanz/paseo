@@ -41,6 +41,8 @@
   ],
   "scripts": {
     "omni:sync-mcp": "node scripts/sync-computer-use-mcp.mjs",
+    "omni:sync-sessions": "node --no-warnings scripts/sync-existing-sessions.mjs",
+    "omni:watch-sessions": "node --no-warnings scripts/sync-existing-sessions.mjs --watch",
     "omni:setup:win": "powershell -ExecutionPolicy Bypass -File ./scripts/setup-windows-node.ps1",
     "omni:setup:mac": "bash ./scripts/setup-mac-node.sh",
     "omni:swarm-mcp": "node scripts/omni-swarm-mcp.mjs",
