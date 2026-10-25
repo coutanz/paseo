@@ -12,7 +12,7 @@
  *   5. Paseo Daemon Config (`~/.paseo/config.json`)
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -243,20 +243,37 @@ async function syncCodexToml(opts, mcpServers, dryRun) {
   console.log(`[ok] Updated ${filePath}`);
 }
 
+function resolveWindowsCodexExe() {
+  if (!isWin) return null;
+  const localAppData = process.env.LOCALAPPDATA || path.join(homeDir, "AppData", "Local");
+  const codexBinRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+  if (!existsSync(codexBinRoot)) return null;
+  try {
+    const candidates = readdirSync(codexBinRoot)
+      .map((sub) => path.join(codexBinRoot, sub, "codex.exe"))
+      .filter((p) => existsSync(p))
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    return candidates[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 async function syncPaseoDaemonConfig(dryRun) {
   const paseoHome = process.env.PASEO_HOME || path.join(homeDir, ".paseo");
   const filePath = path.join(paseoHome, "config.json");
   const current = await readJsonSafe(filePath);
   const nodeExe = process.execPath;
+  const codexExe = resolveWindowsCodexExe();
 
   current.version = current.version ?? 1;
   current.agents = current.agents ?? {};
   current.agents.providers = current.agents.providers ?? {};
 
-  // 1. Codex: enable Full Access (features are configured in ~/.codex/config.toml
-  // so both Paseo 0.10.x and 0.13.x validate config.json cleanly)
+  // 1. Codex: enable Full Access + bind resolved codex.exe path on Windows
   current.agents.providers.codex = {
     enabled: true,
+    ...(codexExe ? { command: [codexExe] } : {}),
     options: {
       approval_policy: "never",
       sandbox_mode: "danger-full-access",

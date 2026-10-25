@@ -1,17 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * Paseo Omni — Universal ACP (Agent Client Protocol) Stdio Bridge
+ * Paseo Omni — 通用 ACP (Agent Client Protocol) Stdio 双向同步桥接器
  *
- * Bridges:
- *   - OpenAI Codex Live Mirror (`codex-desktop` for threads locked by Codex Desktop App)
- *   - Google Antigravity CLI (`agy`) + Antigravity Desktop IDE transcripts
- *   - GLM ZCode CLI (`zcode.cjs` / `zcode`) + `~/.zcode/cli/db/db.sqlite` history
- *   - DeepSeek Harness CLI (`dsh.cmd` / `dsh`) + `~/.dsh/sessions` zstd history
- * into standard ACP JSON-RPC 2.0 over NDJSON stdio, including:
- *   - `session/list` (discover existing local sessions)
- *   - `session/load` (replay full historical conversation into Paseo Mobile/Web/Desktop)
- *   - `session/prompt` (continue existing sessions or start new turns)
+ * 桥接能力：
+ *   - OpenAI Codex (`codex-desktop`)：优先原地 `codex exec resume <threadId>` 写回原会话；仅当桌面端持有独占写锁时无缝切换分支续接
+ *   - Google Antigravity (`antigravity`)：当桌面端 IDE 在线时直连本地 `language_server` ConnectRPC (`SendUserCascadeMessage` / `StartCascade`)，实现手机与桌面端 IDE 窗口 100% 实时双向同步；离线时自动回退 `agy` CLI (`--conversation` + `--dangerously-skip-permissions`)
+ *   - GLM ZCode (`zcode`)：通过 `zcode.cjs --surface desktop --resume <id>` 原地续接，并在每轮结束后回写 `~/.zcode/v2/tasks-index.sqlite` 同步桌面端任务列表
+ *   - DeepSeek Harness (`dsh`)：通过 `dsh --profile headless --json --session-id <id>` 原地续接共享的 `.jsonl.zstd` 会话
  */
 
 import { spawn } from "node:child_process";
@@ -20,9 +16,13 @@ import fs, { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 import {
+  callAntigravityRpc,
+  discoverAntigravityLanguageServer,
   getZCodeSessionTitle,
   isAntigravityCliNativeSession,
+  isAntigravityDesktopSession,
   listAntigravitySessions,
   listCodexSessions,
   listDshSessions,
@@ -31,6 +31,7 @@ import {
   loadCodexHistory,
   loadDshHistory,
   loadZCodeHistory,
+  syncZCodeDesktopTaskIndex,
 } from "./omni-session-store.mjs";
 
 const isWin = process.platform === "win32";
@@ -109,6 +110,10 @@ const PROVIDER_CATALOGS = {
 
 const catalog = PROVIDER_CATALOGS[targetProvider] || PROVIDER_CATALOGS.zcode;
 const sessions = new Map();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function sendRpc(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -250,15 +255,15 @@ function killProcessTree(child) {
 
 function listLocalProviderSessions() {
   if (targetProvider === "codex-desktop") {
-    return listCodexSessions({ limit: 50 });
+    return listCodexSessions({ limit: Infinity });
   }
   if (targetProvider === "antigravity") {
-    return listAntigravitySessions({ limit: 50 });
+    return listAntigravitySessions({ limit: Infinity });
   }
   if (targetProvider === "dsh") {
-    return listDshSessions({ limit: 50 });
+    return listDshSessions({ limit: Infinity });
   }
-  return listZCodeSessions({ limit: 50 });
+  return listZCodeSessions({ limit: Infinity });
 }
 
 function replaySessionHistory(session) {
@@ -267,37 +272,37 @@ function replaySessionHistory(session) {
   let updatedAt = null;
 
   if (targetProvider === "codex-desktop") {
-    const loaded = loadCodexHistory(session.id, 80);
+    const loaded = loadCodexHistory(session.id, 200);
     messages = loaded.messages;
     title = loaded.title;
     updatedAt = loaded.updatedAt;
     if (messages.length > 0) {
       session.handoffContext = messages
-        .slice(-6)
-        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1200)}`)
+        .slice(-8)
+        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1500)}`)
         .join("\n\n");
     }
   } else if (targetProvider === "antigravity") {
-    messages = loadAntigravityHistory(session.id, 80);
-    const meta = listAntigravitySessions({ limit: 60 }).find((s) => s.sessionId === session.id);
+    messages = loadAntigravityHistory(session.id, 200);
+    const meta = listAntigravitySessions({ limit: Infinity }).find((s) => s.sessionId === session.id);
     if (meta) {
       title = meta.title;
       updatedAt = meta.updatedAt;
     }
-    if (!isAntigravityCliNativeSession(session.id) && messages.length > 0) {
-      session.backendSessionId = null;
+    // 保留 backendSessionId 供桌面端 ConnectRPC 原地续接；同时缓存离线回退上下文
+    if (messages.length > 0) {
       session.handoffContext = messages
-        .slice(-6)
-        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1200)}`)
+        .slice(-8)
+        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text.slice(0, 1500)}`)
         .join("\n\n");
     }
   } else if (targetProvider === "dsh") {
-    const loaded = loadDshHistory(session.id, 80);
+    const loaded = loadDshHistory(session.id, 200);
     messages = loaded.messages;
     title = loaded.title;
     updatedAt = loaded.updatedAt;
   } else {
-    messages = loadZCodeHistory(session.id, 80);
+    messages = loadZCodeHistory(session.id, 200);
     const info = getZCodeSessionTitle(session.id);
     if (info) {
       title = info.title;
@@ -338,34 +343,9 @@ function replaySessionHistory(session) {
   }
 }
 
-async function runCodexMirrorTurn(session, promptText) {
-  const { command, baseArgs, shell } = resolveExecutable("codex-desktop");
-  let effectivePrompt = promptText;
-  const args = [...baseArgs, "exec"];
-
-  if (session.forkedThreadId) {
-    args.push(
-      "resume",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--skip-git-repo-check",
-      "--json",
-      session.forkedThreadId,
-      effectivePrompt,
-    );
-  } else {
-    if (session.handoffContext) {
-      effectivePrompt = `[以下是此前在 Codex 桌面端会话中的上下文，请无缝衔继续执行]\n${session.handoffContext}\n\n[用户最新指令]\n${promptText}`;
-      session.handoffContext = null;
-    }
-    args.push(
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--skip-git-repo-check",
-      "--json",
-      effectivePrompt,
-    );
-  }
-
+function executeCodexCli(session, command, args) {
   return new Promise((resolve, reject) => {
+    const { shell } = resolveExecutable("codex-desktop");
     const child = spawn(command, args, {
       cwd: session.cwd,
       env: process.env,
@@ -376,15 +356,17 @@ async function runCodexMirrorTurn(session, promptText) {
 
     let emittedAny = false;
     let stderr = "";
+    let stdoutRaw = "";
     const rl = readline.createInterface({ input: child.stdout });
 
     rl.on("line", (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
+      stdoutRaw = (stdoutRaw + trimmed + "\n").slice(-8192);
       try {
         const evt = JSON.parse(trimmed);
         if (evt.thread_id) {
-          session.forkedThreadId = evt.thread_id;
+          session.activeThreadId = evt.thread_id;
         }
         if (evt.type === "item.completed" && evt.item?.type === "agent_message" && evt.item.text) {
           emittedAny = true;
@@ -399,7 +381,7 @@ async function runCodexMirrorTurn(session, promptText) {
           });
         }
       } catch {
-        // ignore non-json lines
+        // 忽略非 JSON 日志行
       }
     });
 
@@ -414,46 +396,260 @@ async function runCodexMirrorTurn(session, promptText) {
 
     child.on("close", (code) => {
       session.activeChild = null;
-      if (session.canceled) {
-        resolve({ stopReason: "cancelled" });
-        return;
-      }
-      if (code !== 0 && !emittedAny) {
-        sendSessionUpdate(session.id, {
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: stderr.trim() || `Codex exited with code ${code}`,
-          },
-        });
-      }
-      resolve({ stopReason: "end_turn" });
+      resolve({ code, emittedAny, stderr, stdoutRaw });
     });
   });
 }
 
-async function runAntigravityTurn(session, promptText) {
+async function runCodexMirrorTurn(session, promptText) {
+  const { command, baseArgs } = resolveExecutable("codex-desktop");
+
+  // 1. 若尚未分叉且存在原始线程 ID，优先尝试原地 `codex exec resume` 直接写回原 `.codex` 会话
+  const resumeTarget = session.forkedThreadId || session.backendSessionId;
+  if (resumeTarget) {
+    const resumeArgs = [
+      ...baseArgs,
+      "exec",
+      "resume",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "--skip-git-repo-check",
+      "--json",
+      resumeTarget,
+      promptText,
+    ];
+    const res = await executeCodexCli(session, command, resumeArgs);
+    if (session.canceled) {
+      return { stopReason: "cancelled" };
+    }
+    if (res.code === 0 || res.emittedAny) {
+      return { stopReason: "end_turn" };
+    }
+
+    const combinedErr = `${res.stderr}\n${res.stdoutRaw}`;
+    // 若非写锁冲突导致的错误，直接汇报错误信息
+    if (!/active writer|locked|EBUSY/i.test(combinedErr)) {
+      sendSessionUpdate(session.id, {
+        sessionUpdate: "agent_message_chunk",
+        content: {
+          type: "text",
+          text: res.stderr.trim() || `Codex exited with code ${res.code}`,
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+  }
+
+  // 2. 当 Codex 桌面端正占用该线程独占写锁，或者是全新会话时，无缝创建/续接镜像线程
+  let effectivePrompt = promptText;
+  if (session.handoffContext) {
+    effectivePrompt = `[以下是此前在 Codex 桌面端会话中的上下文，请无缝衔继续执行]\n${session.handoffContext}\n\n[用户最新指令]\n${promptText}`;
+    session.handoffContext = null;
+  }
+  const newArgs = [
+    ...baseArgs,
+    "exec",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--skip-git-repo-check",
+    "--json",
+    effectivePrompt,
+  ];
+  const fallbackRes = await executeCodexCli(session, command, newArgs);
+  if (session.activeThreadId) {
+    session.forkedThreadId = session.activeThreadId;
+  }
+  if (session.canceled) {
+    return { stopReason: "cancelled" };
+  }
+  if (fallbackRes.code !== 0 && !fallbackRes.emittedAny) {
+    sendSessionUpdate(session.id, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: fallbackRes.stderr.trim() || `Codex exited with code ${fallbackRes.code}`,
+      },
+    });
+  }
+  return { stopReason: "end_turn" };
+}
+
+/**
+ * 通过本机 Antigravity Desktop 的 `language_server` ConnectRPC 实时双向执行对话：
+ * 手机端发出的消息会直接出现在 Antigravity 桌面版窗口中，桌面版 Agent 的思考与回复也会实时流回手机端。
+ */
+async function runAntigravityDesktopRpcTurn(session, promptText) {
+  let cascadeId = session.backendSessionId;
+  let baselineStepCount = 0;
+
+  if (cascadeId) {
+    // 先读取当前步骤数（若该历史会话尚未加载进 language_server 内存，GetCascadeTrajectorySteps 会自动唤醒它）
+    const allRes = await callAntigravityRpc("GetAllCascadeTrajectories", {}, 6000);
+    const summary = allRes?.trajectorySummaries?.[cascadeId];
+    if (summary && typeof summary.stepCount === "number") {
+      baselineStepCount = summary.stepCount;
+    } else {
+      const stepsRes = await callAntigravityRpc(
+        "GetCascadeTrajectorySteps",
+        { cascadeId, stepOffset: 0 },
+        10_000,
+      );
+      baselineStepCount = Array.isArray(stepsRes?.steps) ? stepsRes.steps.length : 0;
+    }
+
+    await callAntigravityRpc(
+      "SendUserCascadeMessage",
+      {
+        cascadeId,
+        messageText: promptText,
+        items: [{ text: promptText }],
+        continueExecution: true,
+      },
+      15_000,
+    );
+  } else {
+    const wsUri = pathToFileURL(path.resolve(session.cwd)).href;
+    const startRes = await callAntigravityRpc(
+      "StartCascade",
+      {
+        initialPrompt: promptText,
+        items: [{ text: promptText }],
+        workspaceUris: [wsUri],
+      },
+      15_000,
+    );
+    cascadeId = startRes?.cascadeId || startRes?.trajectoryId || startRes?.id;
+    if (!cascadeId) {
+      throw new Error("StartCascade did not return a cascadeId");
+    }
+    session.backendSessionId = cascadeId;
+    baselineStepCount = 0;
+  }
+
+  session.activeCascadeId = cascadeId;
+  const emittedThoughtByStep = new Map();
+  const emittedTextByStep = new Map();
+  let sawActivity = false;
+  let idlePollsAfterStart = 0;
+  const startedAt = Date.now();
+
+  const flushNewSteps = async () => {
+    const stepsRes = await callAntigravityRpc(
+      "GetCascadeTrajectorySteps",
+      { cascadeId, stepOffset: baselineStepCount },
+      10_000,
+    );
+    const steps = Array.isArray(stepsRes?.steps) ? stepsRes.steps : [];
+    if (steps.length > 0) {
+      sawActivity = true;
+    }
+    for (let idx = 0; idx < steps.length; idx += 1) {
+      const absStep = baselineStepCount + idx;
+      const step = steps[idx];
+      if (step?.type !== "CORTEX_STEP_TYPE_PLANNER_RESPONSE" || !step.plannerResponse) {
+        continue;
+      }
+      const pr = step.plannerResponse;
+      const fullThought = String(pr.thinking || "");
+      const prevThought = emittedThoughtByStep.get(absStep) || "";
+      if (fullThought.length > prevThought.length) {
+        const deltaThought = fullThought.startsWith(prevThought)
+          ? fullThought.slice(prevThought.length)
+          : fullThought;
+        emittedThoughtByStep.set(absStep, fullThought);
+        sendSessionUpdate(session.id, {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: deltaThought },
+        });
+      }
+
+      const fullResp = String(pr.modifiedResponse || pr.response || "");
+      const prevResp = emittedTextByStep.get(absStep) || "";
+      if (fullResp.length > prevResp.length) {
+        const deltaResp = fullResp.startsWith(prevResp)
+          ? fullResp.slice(prevResp.length)
+          : fullResp;
+        emittedTextByStep.set(absStep, fullResp);
+        sendSessionUpdate(session.id, {
+          sessionUpdate: "agent_message_chunk",
+          messageId: pr.messageId || `ag-rpc-${absStep}`,
+          content: { type: "text", text: deltaResp },
+        });
+      }
+    }
+  };
+
+  try {
+    while (!session.canceled) {
+      await sleep(600);
+      await flushNewSteps();
+
+      const allRes = await callAntigravityRpc("GetAllCascadeTrajectories", {}, 6000);
+      const summary = allRes?.trajectorySummaries?.[cascadeId];
+      const status = summary?.status || "";
+
+      if (status === "CASCADE_RUN_STATUS_RUNNING") {
+        sawActivity = true;
+        idlePollsAfterStart = 0;
+        continue;
+      }
+
+      if (sawActivity && status && status !== "CASCADE_RUN_STATUS_RUNNING") {
+        // Agent 已完成本轮执行，做最后一次增量拉取确保不丢尾字
+        await flushNewSteps();
+        break;
+      }
+
+      idlePollsAfterStart += 1;
+      // 若超过 15 秒仍未进入 RUNNING 且已有新增步骤，或超过 45 秒完全无响应则安全收尾
+      if ((sawActivity && idlePollsAfterStart >= 6) || Date.now() - startedAt > 600_000) {
+        await flushNewSteps();
+        break;
+      }
+    }
+
+    if (session.canceled) {
+      await callAntigravityRpc("CancelCascadeInvocation", { cascadeId }, 5000).catch(() => {});
+      return { stopReason: "cancelled" };
+    }
+    return { stopReason: "end_turn" };
+  } finally {
+    session.activeCascadeId = null;
+  }
+}
+
+async function runAntigravityCliTurn(session, promptText) {
   const { command, baseArgs, shell } = resolveExecutable("antigravity");
   const args = [
     ...baseArgs,
-    "--print",
     "--input-format",
     "stream-json",
     "--output-format",
     "stream-json",
-    "--verbose",
-    "--approval-mode",
-    session.modeId || "yolo",
+    "--add-dir",
+    session.cwd,
+    "--disable-slash-commands",
   ];
+
+  const mode = session.modeId || "yolo";
+  if (mode === "yolo") {
+    args.push("--dangerously-skip-permissions");
+  } else if (mode === "plan") {
+    args.push("--permission-mode", "plan");
+  } else if (mode === "auto_edit") {
+    args.push("--permission-mode", "acceptEdits");
+  }
+
   if (session.modelId) {
     args.push("--model", session.modelId);
   }
-  if (session.backendSessionId) {
-    args.push("--resume", session.backendSessionId);
+
+  const canResumeCliNative =
+    session.backendSessionId && isAntigravityCliNativeSession(session.backendSessionId);
+  if (canResumeCliNative) {
+    args.push("--conversation", session.backendSessionId);
   }
 
   let effectivePrompt = promptText;
-  if (!session.backendSessionId && session.handoffContext) {
+  if (!canResumeCliNative && session.handoffContext) {
     effectivePrompt = `[以下是此前在 Antigravity 桌面端会话中的最近上下文，请无缝衔继续回答]\n${session.handoffContext}\n\n[用户最新指令]\n${promptText}`;
     session.handoffContext = null;
   }
@@ -549,6 +745,26 @@ async function runAntigravityTurn(session, promptText) {
   });
 }
 
+async function runAntigravityTurn(session, promptText) {
+  const isCliOnly =
+    session.backendSessionId &&
+    isAntigravityCliNativeSession(session.backendSessionId) &&
+    !isAntigravityDesktopSession(session.backendSessionId);
+
+  if (!isCliOnly) {
+    const ls = await discoverAntigravityLanguageServer();
+    if (ls) {
+      try {
+        return await runAntigravityDesktopRpcTurn(session, promptText);
+      } catch {
+        // 若桌面端 RPC 调用中途断开（如用户刚关闭了 IDE），自动回退到 CLI 模式
+      }
+    }
+  }
+
+  return runAntigravityCliTurn(session, promptText);
+}
+
 async function runZCodeTurn(session, promptText) {
   const { command, baseArgs, shell } = resolveExecutable("zcode");
   const args = [
@@ -616,6 +832,16 @@ async function runZCodeTurn(session, promptText) {
 
     child.on("close", (code) => {
       session.activeChild = null;
+      if (session.backendSessionId) {
+        // 双向同步回写 `~/.zcode/v2/tasks-index.sqlite`，使 ZCode 桌面端列表立即刷新置顶
+        syncZCodeDesktopTaskIndex({
+          sessionId: session.backendSessionId,
+          cwd: session.cwd,
+          title: promptText,
+          mode: session.modeId || "yolo",
+          model: session.modelId || "GLM-5.3",
+        });
+      }
       if (session.canceled) {
         resolve({ stopReason: "cancelled" });
         return;
@@ -729,7 +955,7 @@ async function handleRequest(msg) {
         },
         agentInfo: {
           name: catalog.name,
-          version: "1.2.0",
+          version: "2.0.0",
         },
       });
       return;
@@ -766,6 +992,8 @@ async function handleRequest(msg) {
         modeId: catalog.defaultMode,
         backendSessionId: null,
         forkedThreadId: null,
+        activeThreadId: null,
+        activeCascadeId: null,
         handoffContext: null,
         activeChild: null,
         canceled: false,
@@ -790,6 +1018,8 @@ async function handleRequest(msg) {
           modeId: catalog.defaultMode,
           backendSessionId: sessionId,
           forkedThreadId: null,
+          activeThreadId: null,
+          activeCascadeId: null,
           handoffContext: null,
           activeChild: null,
           canceled: false,
@@ -852,6 +1082,8 @@ async function handleRequest(msg) {
           modeId: catalog.defaultMode,
           backendSessionId: sessionId || null,
           forkedThreadId: null,
+          activeThreadId: null,
+          activeCascadeId: null,
           handoffContext: null,
           activeChild: null,
           canceled: false,
@@ -877,9 +1109,18 @@ async function handleRequest(msg) {
 
     case "session/cancel": {
       const session = sessions.get(params?.sessionId);
-      if (session?.activeChild) {
+      if (session) {
         session.canceled = true;
-        killProcessTree(session.activeChild);
+        if (session.activeChild) {
+          killProcessTree(session.activeChild);
+        }
+        if (session.activeCascadeId) {
+          callAntigravityRpc(
+            "CancelCascadeInvocation",
+            { cascadeId: session.activeCascadeId },
+            5000,
+          ).catch(() => {});
+        }
       }
       if (id !== undefined) sendResult(id, {});
       return;
@@ -887,9 +1128,18 @@ async function handleRequest(msg) {
 
     case "session/close": {
       const session = sessions.get(params?.sessionId);
-      if (session?.activeChild) {
+      if (session) {
         session.canceled = true;
-        killProcessTree(session.activeChild);
+        if (session.activeChild) {
+          killProcessTree(session.activeChild);
+        }
+        if (session.activeCascadeId) {
+          callAntigravityRpc(
+            "CancelCascadeInvocation",
+            { cascadeId: session.activeCascadeId },
+            5000,
+          ).catch(() => {});
+        }
       }
       sessions.delete(params?.sessionId);
       if (id !== undefined) sendResult(id, {});
@@ -915,6 +1165,6 @@ rl.on("line", (line) => {
       }
     });
   } catch {
-    // Ignore malformed input lines
+    // 忽略格式异常的输入行
   }
 });
