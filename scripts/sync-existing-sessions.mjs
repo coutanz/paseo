@@ -20,11 +20,12 @@
  *   node --no-warnings scripts/sync-existing-sessions.mjs [--clean] [--limit all|N] [--watch] [--interval 30]
  */
 
-import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import {
   listAntigravitySessions,
@@ -43,6 +44,7 @@ const agentsBaseDir = path.join(paseoHome, "agents");
 const projectsJsonPath = path.join(paseoHome, "projects", "projects.json");
 const workspacesJsonPath = path.join(paseoHome, "projects", "workspaces.json");
 const ledgerPath = path.join(paseoHome, "omni-imported-sessions.json");
+const presyncStatePath = path.join(paseoHome, "omni-presync-state.json");
 
 const ACP_PROVIDER_DEFAULTS = {
   antigravity: { model: "claude-opus-4-6-thinking", modeId: "yolo" },
@@ -57,6 +59,7 @@ function parseArgs(argv) {
     clean: false,
     includeArchived: false,
     watch: false,
+    bootPresync: false,
     intervalSec: 30,
     dryRun: false,
     providers: ["codex", "antigravity", "zcode", "dsh"],
@@ -78,6 +81,8 @@ function parseArgs(argv) {
       opts.includeArchived = true;
     } else if (arg === "--watch") {
       opts.watch = true;
+    } else if (arg === "--boot-presync") {
+      opts.bootPresync = true;
     } else if (arg === "--interval" && argv[i + 1]) {
       opts.intervalSec = Math.max(5, Number.parseInt(argv[i + 1], 10) || 30);
       i += 1;
@@ -200,7 +205,30 @@ async function isDaemonRunning(runner) {
 
 async function startDaemonDetached(runner) {
   if (isWin && runner.paseoCmd && fs.existsSync(runner.paseoCmd)) {
-    const cmdLine = `cmd.exe /c ""${runner.paseoCmd}" daemon start"`;
+    const paseoDir = path.join(localAppData, "Programs", "Paseo");
+    const runnerJs = path.join(
+      paseoDir,
+      "resources",
+      "app.asar.unpacked",
+      "dist",
+      "daemon",
+      "node-entrypoint-runner.js",
+    );
+    const supervisorJs = path.join(
+      paseoDir,
+      "resources",
+      "app.asar",
+      "node_modules",
+      "@getpaseo",
+      "server",
+      "dist",
+      "scripts",
+      "supervisor-entrypoint.js",
+    );
+    const cmdLine =
+      fs.existsSync(runnerJs) && fs.existsSync(supervisorJs)
+        ? `cmd.exe /c "set ELECTRON_RUN_AS_NODE=1&& set PASEO_DESKTOP_MANAGED=1&& "${runner.exe}" --disable-warning=DEP0040 "${runnerJs}" node-script "${supervisorJs}""`
+        : `cmd.exe /c ""${runner.paseoCmd}" daemon start"`;
     const psScript = `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${cmdLine.replace(/'/g, "''")}'; CurrentDirectory = '${homeDir.replace(/'/g, "''")}' } | Out-Null`;
     await execFileAsync("powershell", ["-NoProfile", "-Command", psScript], {
       windowsHide: true,
@@ -477,6 +505,141 @@ function applyCanonicalProjectDisplayNames(cwdToProjectNameMap) {
     // ignore
   }
   return modified;
+}
+
+/**
+ * 纯磁盘级无进程工作区与项目同步：
+ * 在 Paseo Daemon 启动前（`runBootPresync`）直接维护 `projects.json` 与 `workspaces.json`，
+ * 耗时 <5ms，无需等待或拉起任何 `paseo` CLI 子进程。
+ */
+function provisionWorkspacesOnDiskSync(cwds, cwdToProjectNameMap) {
+  let workspaces = [];
+  let projects = [];
+  try {
+    if (fs.existsSync(workspacesJsonPath)) {
+      const parsed = JSON.parse(fs.readFileSync(workspacesJsonPath, "utf8"));
+      if (Array.isArray(parsed)) workspaces = parsed;
+    }
+  } catch {
+    workspaces = [];
+  }
+  try {
+    if (fs.existsSync(projectsJsonPath)) {
+      const parsed = JSON.parse(fs.readFileSync(projectsJsonPath, "utf8"));
+      if (Array.isArray(parsed)) projects = parsed;
+    }
+  } catch {
+    projects = [];
+  }
+
+  let serverId = "srv_local";
+  try {
+    const serverIdFile = path.join(paseoHome, "server-id");
+    if (fs.existsSync(serverIdFile)) {
+      const raw = fs.readFileSync(serverIdFile, "utf8").trim();
+      if (raw) serverId = raw;
+    }
+  } catch {
+    // ignore
+  }
+
+  let modified = false;
+  const wsByNormCwd = new Map();
+  for (const ws of workspaces) {
+    if (ws?.cwd && !ws?.archivedAt) {
+      wsByNormCwd.set(path.resolve(ws.cwd).toLowerCase(), ws);
+    }
+  }
+  const projByNormRoot = new Map();
+  const projById = new Map();
+  for (const proj of projects) {
+    if (proj?.projectId) projById.set(proj.projectId, proj);
+    if (proj?.rootPath && !proj?.archivedAt) {
+      projByNormRoot.set(path.resolve(proj.rootPath).toLowerCase(), proj);
+    }
+  }
+
+  const wsMap = new Map();
+  const nowIso = new Date().toISOString();
+
+  for (const rawCwd of cwds) {
+    if (!rawCwd || !fs.existsSync(rawCwd)) continue;
+    const resolvedCwd = path.resolve(rawCwd);
+    const normCwd = resolvedCwd.toLowerCase();
+    const desiredName =
+      cwdToProjectNameMap.get(normCwd) || path.basename(resolvedCwd) || resolvedCwd;
+    const isGit = fs.existsSync(path.join(resolvedCwd, ".git"));
+
+    let proj = projByNormRoot.get(normCwd);
+    let ws = wsByNormCwd.get(normCwd);
+
+    if (ws && !proj && ws.projectId) {
+      proj = projById.get(ws.projectId);
+    }
+
+    if (!proj) {
+      const projectId = ws?.projectId || `prj_${randomBytes(8).toString("hex")}`;
+      proj = {
+        projectId,
+        rootPath: resolvedCwd,
+        kind: isGit ? "git" : "non_git",
+        displayName: desiredName,
+        projectKey: `host:${serverId}:${normCwd}`,
+        customName: desiredName,
+        customIconRevision: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        archivedAt: null,
+      };
+      projects.push(proj);
+      projByNormRoot.set(normCwd, proj);
+      projById.set(projectId, proj);
+      modified = true;
+    } else if (proj.displayName !== desiredName || proj.customName !== desiredName) {
+      proj.displayName = desiredName;
+      proj.customName = desiredName;
+      modified = true;
+    }
+
+    if (!ws) {
+      const workspaceId = `wks_${randomBytes(8).toString("hex")}`;
+      ws = {
+        workspaceId,
+        projectId: proj.projectId,
+        cwd: resolvedCwd,
+        kind: isGit ? "local_checkout" : "directory",
+        displayName: desiredName,
+        title: desiredName,
+        branch: null,
+        worktreeRoot: isGit ? resolvedCwd.replace(/\\/g, "/") : null,
+        baseBranch: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        archivedAt: null,
+        autoArchivedChangeRequestUrl: null,
+        pinnedAt: null,
+        background: false,
+      };
+      workspaces.push(ws);
+      wsByNormCwd.set(normCwd, ws);
+      modified = true;
+    } else if (ws.displayName !== desiredName || ws.title !== desiredName) {
+      ws.displayName = desiredName;
+      ws.title = desiredName;
+      modified = true;
+    }
+
+    wsMap.set(normCwd, String(ws.workspaceId));
+  }
+
+  if (modified) {
+    writeJsonAtomicSync(projectsJsonPath, projects);
+    writeJsonAtomicSync(workspacesJsonPath, workspaces);
+  }
+
+  return { wsMap, modified };
 }
 
 function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
@@ -802,8 +965,188 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
   return createdCount;
 }
 
+/**
+ * Paseo Desktop / Daemon 启动前极速预同步钩子 (`runBootPresync`)：
+ * 在 `daemon-worker.js`（或 `supervisor-entrypoint.js`）加载磁盘索引前直接同步
+ * Codex / Antigravity / ZCode / DSH 的新增会话与外部更新，纯内存+文件原子写入（~120ms），
+ * 零子进程开销，绝不阻塞 Daemon 启动。
+ */
+export async function runBootPresync(options = {}) {
+  const quiet = options.quiet !== false;
+  const throttleMs = Number.isFinite(options.throttleMs) ? options.throttleMs : 0;
+
+  if (throttleMs > 0 && fs.existsSync(presyncStatePath)) {
+    try {
+      const state = JSON.parse(fs.readFileSync(presyncStatePath, "utf8"));
+      if (state?.lastRunAt && Date.now() - Number(state.lastRunAt) < throttleMs) {
+        return { skipped: true, createdCount: 0, updatedCount: 0, wsModified: false };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const opts = {
+    limitPerProvider: Infinity,
+    includeArchived: false,
+    providers: ["codex", "antigravity", "zcode", "dsh"],
+  };
+
+  const candidates = collectCandidateSessions(opts);
+  const existingBySid = scanStoredOmniRecords();
+
+  const cwdToProjectNameMap = new Map();
+  const catalog = loadCanonicalProjectCatalog();
+  for (const proj of catalog.projectsByNameLower.values()) {
+    if (proj.primaryCwd && fs.existsSync(proj.primaryCwd)) {
+      cwdToProjectNameMap.set(path.resolve(proj.primaryCwd).toLowerCase(), proj.name);
+    }
+  }
+  for (const c of candidates) {
+    const norm = path.resolve(c.cwd).toLowerCase();
+    if (c.projectName) {
+      cwdToProjectNameMap.set(norm, c.projectName);
+    }
+  }
+
+  const uniqueCwds = [
+    ...new Set([
+      ...[...catalog.projectsByNameLower.values()]
+        .map((p) => p.primaryCwd)
+        .filter((p) => p && fs.existsSync(p))
+        .map((p) => path.resolve(p)),
+      ...candidates.map((c) => path.resolve(c.cwd)),
+    ]),
+  ];
+
+  const { wsMap, modified: wsModified } = provisionWorkspacesOnDiskSync(
+    uniqueCwds,
+    cwdToProjectNameMap,
+  );
+
+  let createdCount = 0;
+  let updatedCount = 0;
+  const ledgerKeys = [];
+
+  for (const item of candidates) {
+    const normCwd = path.resolve(item.cwd).toLowerCase();
+    const workspaceId = wsMap.get(normCwd);
+    const existing = existingBySid.get(item.sessionId);
+
+    ledgerKeys.push(`${item.provider}:${item.sessionId}`);
+    ledgerKeys.push(`*:${item.sessionId}`);
+
+    if (!existing) {
+      const record = buildStoredAgentRecord(item, workspaceId);
+      const targetFile = path.join(
+        agentsBaseDir,
+        projectDirNameFromCwd(record.cwd),
+        `${record.id}.json`,
+      );
+      writeJsonAtomicSync(targetFile, record);
+      createdCount += 1;
+    } else if (existing.record?.lastStatus !== "running") {
+      const rec = existing.record;
+      const itemMs = Date.parse(item.updatedAt);
+      const recMs = Date.parse(rec.updatedAt || "");
+      const hasExternalDesktopUpdate =
+        Number.isFinite(itemMs) && (!Number.isFinite(recMs) || itemMs - recMs > 1500);
+      const nextUpdated = hasExternalDesktopUpdate ? item.updatedAt : rec.updatedAt;
+      const needTitleFix = item.title && rec.title !== item.title;
+      const needWsFix = workspaceId && rec.workspaceId !== workspaceId;
+      const needCwdFix = path.resolve(rec.cwd || "") !== path.resolve(item.cwd);
+      const needTimeFix = hasExternalDesktopUpdate;
+
+      if (needTitleFix || needWsFix || needCwdFix || needTimeFix) {
+        const nextRec = {
+          ...rec,
+          cwd: item.cwd,
+          lastStatus: "closed",
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(needTitleFix ? { title: item.title } : {}),
+          ...(needTimeFix
+            ? {
+                updatedAt: nextUpdated,
+                lastActivityAt: nextUpdated,
+                lastUserMessageAt: nextUpdated,
+              }
+            : {}),
+          labels: {
+            ...(rec.labels || {}),
+            omni_sid: item.sessionId,
+            ...(item.projectName ? { omni_project: item.projectName } : {}),
+            ...(item.realCwd ? { omni_real_cwd: item.realCwd } : {}),
+          },
+        };
+        const targetFile = path.join(
+          agentsBaseDir,
+          projectDirNameFromCwd(nextRec.cwd),
+          `${nextRec.id}.json`,
+        );
+        if (existing.filePath !== targetFile && fs.existsSync(existing.filePath)) {
+          try {
+            fs.unlinkSync(existing.filePath);
+          } catch {
+            // ignore
+          }
+        }
+        writeJsonAtomicSync(targetFile, nextRec);
+        updatedCount += 1;
+      }
+    }
+  }
+
+  writeJsonAtomicSync(ledgerPath, Array.from(new Set(ledgerKeys)));
+  writeJsonAtomicSync(presyncStatePath, {
+    lastRunAt: Date.now(),
+    lastRunIso: new Date().toISOString(),
+    createdCount,
+    updatedCount,
+    wsModified,
+    totalCandidates: candidates.length,
+  });
+
+  if (
+    options.reloadRunningDaemonIfChanged &&
+    (createdCount > 0 || updatedCount > 0 || wsModified)
+  ) {
+    try {
+      const pidFile = path.join(paseoHome, "paseo.pid");
+      const anyRunning = [...existingBySid.values()].some(
+        (entry) => entry?.record?.lastStatus === "running",
+      );
+      if (fs.existsSync(pidFile) && !anyRunning) {
+        const runner = resolvePaseoRunner();
+        const child = spawn(runner.exe, [...runner.prefixArgs, "daemon", "restart"], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+          shell: runner.shell,
+          env: runner.env,
+        });
+        child.unref();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!quiet) {
+    console.log(
+      `[boot-presync] 极速预同步完成: 扫描 ${candidates.length} 条会话，新增 ${createdCount} 条，刷新 ${updatedCount} 条`,
+    );
+  }
+
+  return { skipped: false, createdCount, updatedCount, wsModified };
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.bootPresync) {
+    await runBootPresync({ quiet: false, throttleMs: 0 });
+    return;
+  }
+
   const runner = resolvePaseoRunner();
 
   console.log("=== Paseo Omni: 官方项目对齐与全量会话同步 (Phase 6) ===");
@@ -835,7 +1178,13 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("会话同步失败:", err);
-  process.exit(1);
-});
+const isDirectMain =
+  process.argv[1] &&
+  import.meta.url.toLowerCase() === pathToFileURL(path.resolve(process.argv[1])).href.toLowerCase();
+
+if (isDirectMain) {
+  main().catch((err) => {
+    console.error("会话同步失败:", err);
+    process.exit(1);
+  });
+}
