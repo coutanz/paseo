@@ -721,24 +721,34 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
       );
       writeJsonAtomicSync(targetFile, record);
       createdCount += 1;
-    } else if (existing.record?.lastStatus === "closed") {
+    } else if (existing.record?.lastStatus !== "running") {
       const rec = existing.record;
-      const nextUpdated =
-        Date.parse(item.updatedAt) > Date.parse(rec.updatedAt || "")
-          ? item.updatedAt
-          : rec.updatedAt;
+      const itemMs = Date.parse(item.updatedAt);
+      const recMs = Date.parse(rec.updatedAt || "");
+      const hasExternalDesktopUpdate =
+        Number.isFinite(itemMs) && (!Number.isFinite(recMs) || itemMs - recMs > 1500);
+      const nextUpdated = hasExternalDesktopUpdate ? item.updatedAt : rec.updatedAt;
       const needTitleFix = item.title && rec.title !== item.title;
       const needWsFix = workspaceId && rec.workspaceId !== workspaceId;
       const needCwdFix = path.resolve(rec.cwd || "") !== path.resolve(item.cwd);
-      const needTimeFix = nextUpdated !== rec.updatedAt;
+      const needTimeFix = hasExternalDesktopUpdate;
 
       if (needTitleFix || needWsFix || needCwdFix || needTimeFix) {
         const nextRec = {
           ...rec,
           cwd: item.cwd,
+          // 当用户在原桌面客户端继续对话产生新消息时，重置为 closed 休眠态，
+          // 确保下次在 Paseo 点击该会话时重新从桌面端数据库/日志无损拉取最新对话历史
+          lastStatus: "closed",
           ...(workspaceId ? { workspaceId } : {}),
           ...(needTitleFix ? { title: item.title } : {}),
-          ...(needTimeFix ? { updatedAt: nextUpdated, lastActivityAt: nextUpdated } : {}),
+          ...(needTimeFix
+            ? {
+                updatedAt: nextUpdated,
+                lastActivityAt: nextUpdated,
+                lastUserMessageAt: nextUpdated,
+              }
+            : {}),
           labels: {
             ...(rec.labels || {}),
             omni_sid: item.sessionId,
@@ -802,8 +812,20 @@ async function main() {
   console.log(`=== 同步完成（本次新增 ${count} 条，当前 Paseo 共纳管 ${totalStored} 条真实会话） ===`);
 
   if (opts.watch) {
+    const pidFile = path.join(paseoHome, "omni-watcher.pid");
+    if (fs.existsSync(pidFile)) {
+      try {
+        const oldPid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+        if (oldPid && oldPid !== process.pid) {
+          process.kill(oldPid);
+        }
+      } catch {
+        // 旧进程已退出
+      }
+    }
+    writeJsonAtomicSync(pidFile, process.pid);
     console.log(
-      `[watch] 正在每 ${opts.intervalSec} 秒持续监听 Codex / Antigravity / ZCode / DSH 新会话...`,
+      `[watch] 正在每 ${opts.intervalSec} 秒持续监听 Codex / Antigravity / ZCode / DSH 新会话与外部更新 (PID: ${process.pid})...`,
     );
     setInterval(() => {
       syncOnce(opts, runner, { allowClean: false }).catch((err) => {
