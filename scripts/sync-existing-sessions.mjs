@@ -642,10 +642,18 @@ function provisionWorkspacesOnDiskSync(cwds, cwdToProjectNameMap) {
   return { wsMap, modified };
 }
 
+function resolveExecutionCwd(item) {
+  if (item.realCwd && fs.existsSync(item.realCwd)) {
+    return path.resolve(item.realCwd);
+  }
+  return path.resolve(item.cwd);
+}
+
 function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
   const createdAt = item.createdAt || item.updatedAt || new Date().toISOString();
   const updatedAt = item.updatedAt || createdAt;
   const title = item.title || item.sessionId;
+  const execCwd = resolveExecutionCwd(item);
   const labels = {
     omni_sid: item.sessionId,
     ...(item.projectName ? { omni_project: item.projectName } : {}),
@@ -657,7 +665,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
     return {
       id: agentId,
       provider: "codex",
-      cwd: item.cwd,
+      cwd: execCwd,
       ...(workspaceId ? { workspaceId } : {}),
       createdAt,
       updatedAt,
@@ -697,7 +705,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
         nativeHandle: item.sessionId,
         metadata: {
           provider: "codex",
-          cwd: item.cwd,
+          cwd: execCwd,
           ...(item.model ? { model: item.model } : {}),
         },
       },
@@ -714,7 +722,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
   return {
     id: agentId,
     provider: effectiveProvider,
-    cwd: item.cwd,
+    cwd: execCwd,
     ...(workspaceId ? { workspaceId } : {}),
     createdAt,
     updatedAt,
@@ -756,7 +764,7 @@ function buildStoredAgentRecord(item, workspaceId, agentId = randomUUID()) {
       nativeHandle: item.sessionId,
       metadata: {
         provider: "acp",
-        cwd: item.cwd,
+        cwd: execCwd,
         model: defaults.model,
         title,
         modeId: defaults.modeId,
@@ -891,15 +899,16 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
       const hasExternalDesktopUpdate =
         Number.isFinite(itemMs) && (!Number.isFinite(recMs) || itemMs - recMs > 1500);
       const nextUpdated = hasExternalDesktopUpdate ? item.updatedAt : rec.updatedAt;
+      const execCwd = resolveExecutionCwd(item);
       const needTitleFix = item.title && rec.title !== item.title;
       const needWsFix = workspaceId && rec.workspaceId !== workspaceId;
-      const needCwdFix = path.resolve(rec.cwd || "") !== path.resolve(item.cwd);
+      const needCwdFix = path.resolve(rec.cwd || "") !== execCwd;
       const needTimeFix = hasExternalDesktopUpdate;
 
       if (needTitleFix || needWsFix || needCwdFix || needTimeFix) {
         const nextRec = {
           ...rec,
-          cwd: item.cwd,
+          cwd: execCwd,
           // 当用户在原桌面客户端继续对话产生新消息时，重置为 closed 休眠态，
           // 确保下次在 Paseo 点击该会话时重新从桌面端数据库/日志无损拉取最新对话历史
           lastStatus: "closed",
@@ -910,6 +919,17 @@ async function syncOnce(opts, runner, { allowClean = false } = {}) {
                 updatedAt: nextUpdated,
                 lastActivityAt: nextUpdated,
                 lastUserMessageAt: nextUpdated,
+              }
+            : {}),
+          ...(rec.persistence
+            ? {
+                persistence: {
+                  ...rec.persistence,
+                  metadata: {
+                    ...(rec.persistence.metadata || {}),
+                    cwd: execCwd,
+                  },
+                },
               }
             : {}),
           labels: {
@@ -1052,15 +1072,16 @@ export async function runBootPresync(options = {}) {
       const hasExternalDesktopUpdate =
         Number.isFinite(itemMs) && (!Number.isFinite(recMs) || itemMs - recMs > 1500);
       const nextUpdated = hasExternalDesktopUpdate ? item.updatedAt : rec.updatedAt;
+      const execCwd = resolveExecutionCwd(item);
       const needTitleFix = item.title && rec.title !== item.title;
       const needWsFix = workspaceId && rec.workspaceId !== workspaceId;
-      const needCwdFix = path.resolve(rec.cwd || "") !== path.resolve(item.cwd);
+      const needCwdFix = path.resolve(rec.cwd || "") !== execCwd;
       const needTimeFix = hasExternalDesktopUpdate;
 
       if (needTitleFix || needWsFix || needCwdFix || needTimeFix) {
         const nextRec = {
           ...rec,
-          cwd: item.cwd,
+          cwd: execCwd,
           lastStatus: "closed",
           ...(workspaceId ? { workspaceId } : {}),
           ...(needTitleFix ? { title: item.title } : {}),
@@ -1069,6 +1090,17 @@ export async function runBootPresync(options = {}) {
                 updatedAt: nextUpdated,
                 lastActivityAt: nextUpdated,
                 lastUserMessageAt: nextUpdated,
+              }
+            : {}),
+          ...(rec.persistence
+            ? {
+                persistence: {
+                  ...rec.persistence,
+                  metadata: {
+                    ...(rec.persistence.metadata || {}),
+                    cwd: execCwd,
+                  },
+                },
               }
             : {}),
           labels: {
